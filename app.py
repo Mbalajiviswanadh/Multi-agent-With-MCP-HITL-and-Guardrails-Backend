@@ -1,12 +1,16 @@
-
+from pathlib import Path
 import traceback
 import uvicorn
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
-from backend import run_travel_agent, travel_graph, _conn
+from backend import run_travel_agent, travel_graph, _conn, resume_travel_agent
 import os
 import json
 import uuid
@@ -58,6 +62,11 @@ class TravelRequest(BaseModel):
     message: str
     thread_id: str | None = None
 
+class ApprovalRequest(BaseModel):
+    thread_id: str = Field(min_length=1)
+    approved: bool
+    feedback: str = ""
+
 
 # =========================
 # Travel API Endpoint
@@ -65,57 +74,93 @@ class TravelRequest(BaseModel):
 
 @app.post("/api/travel")
 async def travel_planner(request_data: TravelRequest):
-
     try:
         user_message = request_data.message.strip()
 
         if not user_message:
-            raise HTTPException(
+            return JSONResponse(
                 status_code=400,
-                detail="Message cannot be empty."
+                content={
+                    "success": False,
+                    "error": "Message cannot be empty.",
+                },
             )
 
         result = run_travel_agent(
             user_input=user_message,
-            thread_id=request_data.thread_id
+            thread_id=request_data.thread_id,
         )
 
-        return {
-            "success": True,
-            "thread_id": result["thread_id"],
-            "answer": result["answer"],
-            "route": result.get("route", "travel"),
-            "flight_results": result["flight_results"],
-            "hotel_results": result["hotel_results"],
-            "itinerary": result["itinerary"],
-            "llm_calls": result["llm_calls"]
-        }
+        return JSONResponse(
+            content={
+                "success": True,
+                **result,
+            }
+        )
 
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        print("ERROR:", e)
+    except Exception as exc:
+        print("ERROR:", exc)
         traceback.print_exc()
 
-        raise HTTPException(
+        return JSONResponse(
             status_code=500,
-            detail="Something went wrong while processing your travel request."
+            content={
+                "success": False,
+                "error": str(exc),
+            },
         )
 
+@app.post("/api/travel/approve")
+async def approve_travel_plan(request_data: ApprovalRequest):
+    try:
+        if not request_data.approved and not request_data.feedback.strip():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": "Please provide revision feedback when rejecting the draft.",
+                },
+            )
+
+        result = resume_travel_agent(
+            thread_id=request_data.thread_id,
+            approved=request_data.approved,
+            feedback=request_data.feedback,
+        )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                **result,
+            }
+        )
+
+    except Exception as exc:
+        print("APPROVAL ERROR:", exc)
+        traceback.print_exc()
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(exc),
+            },
+        )
 
 # =========================
 # Health Check Endpoint
 # =========================
-
 @app.get("/health")
 async def health_check():
-
     return {
         "status": "ok",
-        "message": "Trip Multi-Agent is running"
+        "message": "TripMate AI API is running",
+        "features": [
+            "supervisor_agent",
+            "input_guardrail",
+            "human_in_the_loop",
+        ],
     }
-
 
 # =========================
 # History Endpoint  (paginated trips)

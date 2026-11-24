@@ -1,4 +1,4 @@
-from tools.flight_tool import search_flights
+# from tools.flight_tool import search_flights
 
-res = search_flights("Plan a 7 days Nepal trip from Hyderabad")
-print(res)
+# res = search_flights("Plan a 7 days Nepal trip from Hyderabad")
+# print(res)
