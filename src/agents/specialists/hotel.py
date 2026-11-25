@@ -27,7 +27,8 @@ def _trim_context(text, max_chars: int = 1800) -> str:
 def hotel_agent(state: TravelState) -> dict:
     start_time = time.time()
     logger.info("[HOTEL_AGENT] -> Running hotel search via Tavily MCP...")
-    query = f"Best hotels for {state['user_query']}"
+    effective_query = state.get("resolved_query") or state.get("user_query", "")
+    query = f"Best hotels for {effective_query}"
 
     try:
         raw_results = asyncio.run(tavily_mcp_search(query))

@@ -26,11 +26,12 @@ def _trim_context(text, max_chars: int = 1200) -> str:
 def budget_agent(state: TravelState) -> dict:
     start_time = time.time()
     logger.info("[BUDGET_AGENT] -> Analyzing budget feasibility...")
+    effective_query = state.get("resolved_query") or state.get("user_query", "")
     prompt = f"""\
 Analyze whether this trip is realistic for the user's budget.
 
 User Query:
-{state['user_query']}
+{effective_query}
 
 Trip Constraints:
 {state.get('trip_constraints', {})}

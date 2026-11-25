@@ -102,30 +102,75 @@ def supervisor_agent(state: TravelState) -> dict:
         }
 
     # ── TRAVEL ───────────────────────────────────────────────────────────
-    # Plan specialist agents & extract trip constraints
+    # Plan specialist agents & extract trip constraints with query disambiguation
+    existing_constraints = state.get("trip_constraints") or empty_constraints()
+    context_summary = state.get("context_summary", "")
+
+    _INTERNAL_HANDOFFS = {
+        "Routing to travel specialists.",
+        "Routing to chat agent.",
+        "Flight information processed.",
+        "Hotel information processed.",
+        "Weather information processed.",
+        "Weather information requires a destination.",
+        "Budget analysis processed.",
+        "Draft itinerary created.",
+    }
+    all_messages = state.get("messages", [])
+    real_messages = [
+        m for m in all_messages[:-1]
+        if not (isinstance(m, AIMessage) and str(m.content).strip() in _INTERNAL_HANDOFFS)
+    ]
+    history_lines = []
+    for msg in real_messages[-6:]:
+        role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+        snippet = str(msg.content).strip()
+        if len(snippet) > 180:
+            snippet = snippet[:180] + "..."
+        history_lines.append(f"{role}: {snippet}")
+    recent_history_str = "\n".join(history_lines) if history_lines else "None (first turn)"
+
     supervisor_prompt = f"""\
 You are the supervisor of a multi-agent travel-planning system.
-Choose only the specialist agents needed for the request.
+Analyze the user request and choose ONLY the specialist agents that are strictly needed.
 
 Available agents:
-- flight_agent: flights, airports, airlines, routes, airfare, or booking advice
-- hotel_agent: hotels, accommodation, neighborhoods, or places to stay
-- weather_agent: weather, climate, season, forecast, or packing advice
-- budget_agent: cost, affordability, price limits, or budget feasibility
-- itinerary_agent: creates the integrated travel plan and must always be included
+- flight_agent: ONLY when user asks for flights, airlines, routes, airfare, or flight booking advice.
+- hotel_agent: ONLY when user asks for hotels, accommodation, resorts, neighborhoods, or places to stay.
+- weather_agent: ONLY when user asks for weather, climate, season, forecast, or packing advice.
+- budget_agent: ONLY when user asks about budget feasibility, cost estimation, or price limits.
+- itinerary_agent: ONLY when user asks for a multi-day trip plan, day-by-day itinerary, schedule, tour, or full travel planning.
+
+ACTIVE CONVERSATION CONTEXT:
+Summary: {context_summary or "None"}
+Recent Turns:
+{recent_history_str}
+
+CURRENT ACTIVE TRIP CONSTRAINTS:
+{json.dumps(existing_constraints, indent=2)}
+
+CRITICAL ROUTING & DISAMBIGUATION RULES:
+1. SPECIFIC INQUIRIES: If the user is only asking for one specific topic (e.g. "hotels near Guntur railway station", "flights from Delhi to Dubai", "weather in Shimla in December"), select ONLY that specific agent (e.g. ["hotel_agent"]). DO NOT include itinerary_agent unless the user explicitly requested an itinerary or schedule!
+2. COMPLETE TRIP PLANNING: If the user asks for a complete trip, vacation, holiday, or multi-day itinerary (e.g. "Plan a 3-day trip to Goa with flights and hotel under 20k"), select all relevant specialists plus "itinerary_agent".
+3. QUERY DISAMBIGUATION & COREFERENCE RESOLUTION:
+   - If the user request contains relative words (e.g. "there", "that hotel", "the second option", "fly back on Sunday", "what about weather?"), resolve them using the recent conversation history and active trip constraints.
+   - Output the resolved standalone query in "resolved_query".
+4. CONSTRAINT INHERITANCE:
+   - Inherit active constraints (destination, origin, duration, budget, travel_style) unless the user explicitly changes or overrides them.
 
 Return strict JSON only using this schema:
 {{
-  "selected_agents": ["flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"],
+  "selected_agents": ["hotel_agent"],
+  "resolved_query": "self-contained disambiguated user query",
   "trip_constraints": {{
-    "destination": "",
-    "origin": "",
+    "destination": "inherited or newly specified destination",
+    "origin": "inherited or newly specified origin",
     "duration": "",
     "budget": "",
     "travel_style": "",
     "special_preferences": []
   }},
-  "reasoning": ""
+  "reasoning": "brief explanation of why these agents were selected"
 }}
 
 User request:
@@ -146,25 +191,42 @@ User request:
             if name in requested_agents and name in KNOWN_AGENTS
         ]
 
-        if "itinerary_agent" not in selected_agents:
-            selected_agents.append("itinerary_agent")
+        # If no agents were selected, intelligently default based on query keywords
+        if not selected_agents:
+            q_lower = query.lower()
+            if any(k in q_lower for k in ["hotel", "stay", "resort", "lodge", "room"]):
+                selected_agents = ["hotel_agent"]
+            elif any(k in q_lower for k in ["flight", "airline", "fly", "airfare", "airport"]):
+                selected_agents = ["flight_agent"]
+            elif any(k in q_lower for k in ["weather", "climate", "temperature", "rain", "forecast"]):
+                selected_agents = ["weather_agent"]
+            elif any(k in q_lower for k in ["budget", "cost", "afford", "price", "expensive"]):
+                selected_agents = ["budget_agent"]
+            else:
+                selected_agents = ["itinerary_agent"]
 
         constraints = empty_constraints()
+        if existing_constraints:
+            constraints.update(existing_constraints)
         parsed_constraints = parsed.get("trip_constraints", {})
         if isinstance(parsed_constraints, dict):
-            constraints.update(parsed_constraints)
+            for k, v in parsed_constraints.items():
+                if v:
+                    constraints[k] = v
 
+        resolved_query = str(parsed.get("resolved_query") or query).strip()
         reasoning = str(parsed.get("reasoning", "")).strip()
         llm_calls += 1
     except Exception as exc:
         logger.warning("[SUPERVISOR] Planning fallback: %s", exc)
-        selected_agents = AGENT_ORDER.copy()
-        constraints = empty_constraints()
-        reasoning = "Supervisor parsing fallback: selected full travel workflow."
+        selected_agents = ["itinerary_agent"]
+        constraints = existing_constraints or empty_constraints()
+        resolved_query = query
+        reasoning = "Supervisor parsing fallback: routed to default travel planning."
 
     elapsed = time.time() - start_time
     agent_names = ", ".join(name.replace("_agent", "") for name in selected_agents)
-    logger.info("[SUPERVISOR] OK TRAVEL intent (%.1fs) | Agents: [%s]", elapsed, agent_names)
+    logger.info("[SUPERVISOR] OK TRAVEL intent (%.1fs) | Agents: [%s] | Query: '%s'", elapsed, agent_names, resolved_query)
 
     return {
         "guardrail_allowed": True,
@@ -172,6 +234,7 @@ User request:
         "guardrail_reason": guardrail_reason,
         "selected_agents": selected_agents,
         "trip_constraints": constraints,
+        "resolved_query": resolved_query,
         "supervisor_reasoning": reasoning,
         "messages": [AIMessage(content="Supervisor created the agent plan.")],
         "llm_calls": llm_calls,

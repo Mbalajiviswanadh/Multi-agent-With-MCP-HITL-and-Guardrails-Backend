@@ -584,3 +584,241 @@ uv run python evals\test_deepeval.py
 ---
 
 *This document is auto-updated after each implementation phase.*
+
+---
+
+## ✅ Phase 15 — Production-Ready Dynamic Routing & HITL Decoupling
+
+### What Was Fixed & Why
+
+**Problem Identified:**
+1. **Forced `itinerary_agent`:** Previously, the supervisor was hardcoded to append `itinerary_agent` to *every* travel query. When a user asked a simple standalone question like `"what are the nearest best hotels near Guntur railway station?"`, the system forced an entire 1-day itinerary with timings (07:00, 08:30, etc.) that the user never asked for.
+2. **Unnecessary HITL Interrupts:** Because `itinerary_agent` was forced, the system paused on an `interrupt()` for human approval, making the user click "Approve" just to see a hotel search result.
+3. **Hardcoded Response Sections in Final Agent:** When the user clicked "Approve", `final_agent` used a hardcoded prompt template that unconditionally outputted `Flight Information`, `Weather Information`, `Day-by-Day Itinerary`, and `Budget`, even when the user never asked for flights and no flight tools were called. This resulted in hallucinated flight disclaimers and duplicate unwanted sections.
+
+### Solution Architecture
+
+```
+User Query: "Hotels near Guntur railway station"
+     │
+     ▼
+[Supervisor]  →  Analyzes query with refined routing prompt
+     │           Selects ONLY ["hotel_agent"] (itinerary_agent is NOT forced)
+     ▼
+[hotel_agent] →  Executes live Tavily search
+     │
+     ▼
+[Conditional Edge] → Checks next agents in selected_agents
+     │                No more specialist agents?
+     │                Is itinerary_agent in selected? NO → Routes directly to [final_agent]!
+     ▼
+[final_agent] →  Inspects selected_agents (only hotel_agent)
+     │           Generates focused Hotel Guide with proximity, amenities, and rates.
+     │           Strictly OMITS Flight Information, Weather, and Itinerary sections!
+     ▼
+[END]        →  Completed directly in ONE turn! requires_approval = False.
+```
+
+When a user **does** ask for a full trip (e.g. `"Plan a 3-day trip to Goa with flights and hotel under ₹20k"`):
+1. `supervisor` selects `["flight_agent", "hotel_agent", "budget_agent", "itinerary_agent"]`.
+2. Specialists execute -> `itinerary_agent` drafts the cohesive multi-day plan.
+3. `itinerary_agent` routes to `human_approval` which pauses execution via `interrupt()`.
+4. User reviews and approves in the UI.
+5. `final_agent` resumes, polishes the approved draft, and presents the final plan.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/agents/supervisor.py` | Removed forced `selected_agents.append("itinerary_agent")`. Added strict routing rules: single-topic queries select only that specialist. |
+| `src/agents/graph.py` | Added `"final_agent"` to `ROUTE_MAP`. If `itinerary_agent` is not selected, routes directly from the last specialist to `final_agent` without pausing for approval. |
+| `src/agents/final.py` | Replaced hardcoded 7-section prompt with dynamic section generation based strictly on which agents ran. For hotel-only queries, omits flight/weather/itinerary sections. |
+| `03-Travel-MultiAgent-frontend/src/components/FlowPanel.jsx` | Updated `buildSteps()`: only displays the `human` review step when approval was actually involved (`kind === 'draft'` or `message.approval`). |
+| `evals/datasets/golden_queries.jsonl` | Updated single-domain queries so `expected_agents` accurately expects only the specific specialist. |
+| `evals/test_routing.py` | Removed hardcoded `selected.add("itinerary_agent")` so routing precision measures true selective dispatching. |
+| `scripts/test_targeted_routing.py` | **New** — Verifies hotel-only query runs in 1 turn without approval and full trip pauses for HITL approval. |
+
+### Verification Results
+
+```
+============================================================
+TEST 1: Hotel-only query ("nearest best hotels near guntur railwaystation")
+============================================================
+Selected Agents      : ['hotel_agent']
+Requires Approval?   : False
+Contains 'Flight'    : False (no hallucinated flight section)
+Contains 'Itinerary' : False (no forced 1-day itinerary)
+✓ TEST 1 PASSED: Only hotel_agent was called, no approval was forced.
+
+============================================================
+TEST 2: Full trip query ("Plan a 3-day trip from Hyderabad to Goa...")
+============================================================
+Selected Agents    : ['flight_agent', 'hotel_agent', 'budget_agent', 'itinerary_agent']
+Requires Approval? : True
+--- Resuming with Approval ---
+✓ TEST 2 PASSED: Approved draft finalized cleanly without unrequested section duplication.
+```
+
+**Concept Covered:** Dynamic Subgraph Routing, Selective Specialist Dispatching, Conditional Human-in-the-Loop, Adaptive Response Synthesis.
+
+---
+
+## ✅ Phase 16 — Thread-Level Conversational Memory & Coreference Resolution
+
+### What was the problem?
+
+In multi-turn chat interactions, the system suffered from two critical memory breakdowns:
+1. **Chat Agent In-Thread Amnesia:** When the user asked a conversational follow-up like *"can you tell me what i asked above?"*, the `chat_agent` replied *"It looks like you haven't asked a question yet in this chat..."*. This occurred because `chat_agent` only sent `[SystemMessage, HumanMessage(current_query)]` to the LLM, discarding the actual thread message history stored in LangGraph's PostgreSQL checkpointer.
+2. **Coreference & Constraint Loss:** In a multi-turn travel planning session:
+   - *Turn 1:* User asks *"what are the nearest best hotels near guntur railwaystation?"* $\rightarrow$ The agent provides hotels in Guntur.
+   - *Turn 2:* User follows up: *"what are the flight options there from Hyderabad?"*
+   - Because the query contained the relative pronoun *"there"*, naive query processing didn't know what *"there"* referred to. The destination constraint (`Guntur`) was dropped, causing flight search to fail or prompt the user again.
+3. **Context Window & Latency Risks:** Adding an independent "Query Rewriter" LLM node adds an extra 1.5–2s of latency and token cost to *every single user turn*, which degrades production responsiveness and balloons LLM costs.
+
+---
+
+### The Solution: 4-Tier Hybrid Production Architecture (0 Extra LLM Calls)
+
+To achieve production-grade speed, memory retention, and context window efficiency, we implemented a 4-tier hybrid memory strategy:
+
+```
+                      ┌────────────────────────────────────────┐
+                      │              User Message              │
+                      └───────────────────┬────────────────────┘
+                                          │
+                                          ▼
+                      ┌────────────────────────────────────────┐
+                      │    Load State & Thread History         │
+                      │  (Sliding Window k=6 from Postgres)    │
+                      └───────────────────┬────────────────────┘
+                                          │
+                        Is thread length ≥ 10 messages?
+                                  /            \
+                             Yes /              \ No
+                                ▼                │
+                    ┌──────────────────────┐     │
+                    │   Rolling Summary    │     │
+                    │ (Summarize k > 4 in  │     │
+                    │   context_summary)   │     │
+                    └───────────┬──────────┘     │
+                                │                ▼
+                                └─────────► Continue
+                                                 │
+                                                 ▼
+             ┌───────────────────────────────────────────────────────────────────┐
+             │       2-in-1 Supervisor Agent (Disambiguation + Routing)         │
+             │                                                                   │
+             │  • Receives active constraints + recent dialogue turns            │
+             │  • Resolves pronouns ("there" → "Guntur", "that hotel" → name)   │
+             │  • Inherits & updates trip_constraints (destination="Guntur")     │
+             │  • Selects ONLY necessary specialist agents                       │
+             │                                                                   │
+             │              ★ ZERO EXTRA LLM CALLS ADDED! ★                      │
+             └───────────────────────────────────┬───────────────────────────────┘
+                                                 │
+                     ┌───────────────────────────┴───────────────────────────┐
+                     ▼                                                       ▼
+        [chat_intent]                                          [travel_intent]
+               │                                                              │
+               ▼                                                              ▼
+    ┌──────────────────────────┐                               ┌──────────────────────────┐
+    │        chat_agent        │                               │    Specialist Agents     │
+    │  • System Prompt         │                               │  • Uses resolved_query   │
+    │  • context_summary       │                               │  • Uses trip_constraints │
+    │  • Sliding window (k=6)  │                               │    (destination, origin) │
+    │  Full conversational     │                               │  • Executes live tools   │
+    │  thread recall!          │                               └──────────────┬───────────┘
+    └──────────────────────────┘                                              │
+                                                                              ▼
+                                                               ┌──────────────────────────┐
+                                                               │       final_agent        │
+                                                               │  Dynamic synthesis of    │
+                                                               │  only executed results   │
+                                                               └──────────────────────────┘
+```
+
+#### 1. Sliding Window History (Zero Extra LLM Calls)
+- In `src/agents/chat.py`, `chat_agent` extracts the last 6 messages (`state["messages"][-6:]`) from LangGraph's checkpointer.
+- It supplies the LLM with `[SystemMessage(content=prompt), *history_window]`, allowing the chat agent to accurately reference previous turns and answer conversational queries such as *"what was my previous question?"*.
+
+#### 2. Constraint Inheritance (Zero LLM Calls)
+- In `src/agents/graph.py`, `run_travel_agent()` inspects the current state checkpointer via `travel_graph.get_state(config)`.
+- It preserves existing `trip_constraints` (destination, origin, budget, travelers) across turns so specialists always retain previously established trip parameters.
+
+#### 3. 2-in-1 Supervisor Coreference Resolution & Routing (Zero Extra LLM Calls)
+- Rather than inserting a separate query rewriter agent before the supervisor (which would add +1.5s latency to every turn), the `supervisor_agent` prompt was expanded with conversation context and active constraints.
+- In a single LLM invocation, the supervisor:
+  1. Identifies if the query contains relative references (*"there"*, *"that hotel"*, *"second option"*).
+  2. Resolves it into `resolved_query` (e.g. *"what are the flight options to Guntur from Hyderabad?"*).
+  3. Merges detected entities into `trip_constraints`.
+  4. Selects the appropriate specialist agents.
+- Specialist agents (`flight.py`, `hotel.py`, `weather.py`, `budget.py`) consume `state.get("resolved_query") or state.get("user_query")`.
+
+#### 4. Conditional Rolling Summary (Run only on Long Threads $\ge 10$ messages)
+- For short chats ($< 10$ messages), no summarization runs (0 overhead).
+- When conversation exceeds 10 turns, `_generate_rolling_summary()` triggers, condensing turns older than the last 4 into 2–3 crisp bullet points in `state["context_summary"]`.
+- This summary is prepended to the system prompts of `chat_agent` and `supervisor_agent`, allowing unbounded conversation depth without blowing up LLM context limits.
+
+---
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/agents/state.py` | Added `resolved_query: str` to `TravelState` and `initial_state()` to hold the disambiguated prompt. |
+| `src/agents/chat.py` | Implemented sliding window memory (`state["messages"][-6:]`) and dynamic injection of `context_summary` into the LLM system prompt. |
+| `src/agents/supervisor.py` | Upgraded prompt to include recent conversation turns (`history_lines`) and active constraints. Performs ambiguity resolution, constraint updating, and specialist routing in 1 unified call. |
+| `src/agents/graph.py` | Updated `run_travel_agent()` to retrieve and preserve existing `trip_constraints` and `context_summary` from checkpointer across turns. Added `_generate_rolling_summary()`. Updated `serialize_result()` to return `resolved_query`. |
+| `src/agents/specialists/flight.py` | Consumes `effective_query = state.get("resolved_query") or state.get("user_query")`. Inherits origin/destination from `trip_constraints`. |
+| `src/agents/specialists/hotel.py` | Uses `effective_query = state.get("resolved_query") or state.get("user_query")` for live search. |
+| `src/agents/specialists/weather.py` | Prioritizes destination from `state.get("trip_constraints", {}).get("destination")` and `resolved_query`. |
+| `src/agents/specialists/budget.py` | Uses `effective_query` and inherited trip constraints. |
+| `scripts/test_chat_memory.py` | **New** — Comprehensive multi-turn test simulating: (1) Hotel search, (2) Conversational recall of prior query, (3) Pronoun resolution ("there" $\rightarrow$ "Guntur"). |
+
+---
+
+### Verification Results
+
+Ran end-to-end multi-turn test suite (`scripts/test_chat_memory.py`):
+
+```
+======================================================================
+TEST 1: Initial query -> Hotels in Guntur
+======================================================================
+User Query       : what are the nearest best hotels near guntur railwaystation?
+Intent           : travel
+Selected Agents  : ['hotel_agent']
+Resolved Query   : what are the nearest best hotels near guntur railwaystation?
+Destination in State: Guntur
+Requires Approval: False
+✓ Turn 1 PASSED: Targeted hotel search executed and destination stored.
+
+======================================================================
+TEST 2: Conversational recall ("can you tell me what i asked above?")
+======================================================================
+User Query       : can you tell me what i asked above?
+Intent           : chat
+Selected Agents  : []
+Chat Response    : You asked for the nearest best hotels near Guntur railway station.
+Recalled Guntur? : True
+Response not blank: True
+✓ Turn 2 PASSED: Chat agent accurately recalled the earlier question in the same thread.
+
+======================================================================
+TEST 3: Relative follow-up ("what are the flight options there from Hyderabad?")
+======================================================================
+User Query       : what are the flight options there from Hyderabad?
+Intent           : travel
+Selected Agents  : ['flight_agent']
+Resolved Query   : what are the flight options to Guntur from Hyderabad?
+Origin in State  : Hyderabad
+Destination in State: Guntur
+Requires Approval: False
+✓ Turn 3 PASSED: Supervisor resolved 'there' -> Guntur and dispatched flight_agent.
+
+======================================================================
+ALL THREAD MEMORY & CONVERSATIONAL TESTS PASSED 100%!
+======================================================================
+```
+
+**Concept Covered:** Thread-Level State Checkpointing, Sliding Window Context, Coreference Resolution, Constraint Inheritance, Zero-LLM-Overhead Disambiguation, Rolling Summarization.

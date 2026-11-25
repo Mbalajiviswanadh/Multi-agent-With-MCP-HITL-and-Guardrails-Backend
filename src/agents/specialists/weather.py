@@ -23,7 +23,23 @@ logger = get_logger("TripMateAI.agents.weather")
 
 def weather_agent(state: TravelState) -> dict:
     start_time = time.time()
-    city = extract_destination(state["user_query"])
+    city = state.get("trip_constraints", {}).get("destination", "").strip()
+    if not city:
+        try:
+            city = extract_destination(state.get("resolved_query") or state["user_query"])
+        except ValueError:
+            city = ""
+
+    if not city:
+        logger.warning("[WEATHER_AGENT] No destination found in constraints or query.")
+        return {
+            "weather_results": (
+                "No destination city was specified or found in the current conversation. "
+                "Please ask the user which city or place they would like the weather forecast for."
+            ),
+            "messages": [AIMessage(content="Weather information requires a destination.")],
+        }
+
     logger.info("[WEATHER_AGENT] -> Fetching weather for '%s'...", city)
 
     try:

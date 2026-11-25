@@ -66,6 +66,7 @@ ROUTE_MAP = {
     "weather_agent":     "weather_agent",
     "budget_agent":      "budget_agent",
     "itinerary_agent":   "itinerary_agent",
+    "final_agent":       "final_agent",
 }
 
 
@@ -84,7 +85,7 @@ def route_from_supervisor(state: TravelState) -> str:
         return "chat_agent"
 
     selected = _selected_agents(state)
-    return selected[0] if selected else "itinerary_agent"
+    return selected[0] if selected else "final_agent"
 
 
 def route_after_agent(current_agent: str):
@@ -94,7 +95,9 @@ def route_after_agent(current_agent: str):
         for next_agent in AGENT_ORDER[current_index + 1:]:
             if next_agent in selected:
                 return next_agent
-        return "itinerary_agent"
+        if "itinerary_agent" in selected:
+            return "itinerary_agent"
+        return "final_agent"
     return route
 
 
@@ -170,6 +173,7 @@ def serialize_result(result: dict[str, Any], thread_id: str) -> dict[str, Any]:
         "thread_id":            thread_id,
         "answer":               answer,
         "query_intent":         result.get("query_intent", "travel"),
+        "resolved_query":       result.get("resolved_query", result.get("user_query", "")),
         "requires_approval":    interrupt_payload is not None,
         "approval_request":     (
             interrupt_payload.get("approval_request", "")
@@ -200,6 +204,35 @@ def serialize_result(result: dict[str, Any], thread_id: str) -> dict[str, Any]:
 # Execution Runners
 # =========================
 
+def _generate_rolling_summary(older_messages: list, current_summary: str) -> str:
+    """Summarize older messages into 2-3 concise bullet points to keep context small."""
+    from langchain_core.messages import SystemMessage, HumanMessage
+    convo_text = []
+    for m in older_messages:
+        role = "User" if isinstance(m, HumanMessage) else "Assistant"
+        snippet = str(m.content).strip()
+        if len(snippet) > 250:
+            snippet = snippet[:250] + "..."
+        convo_text.append(f"{role}: {snippet}")
+    text_block = "\n".join(convo_text)
+    prompt = f"""Summarize the key facts, destination, hotel choices, constraints, and decisions made in this previous conversation into 2-3 concise bullet points.
+Previous summary: {current_summary or 'None'}
+
+Conversation:
+{text_block}
+
+Return only the updated 2-3 bullet points."""
+    try:
+        res = resilient_llm.invoke([
+            SystemMessage(content="You are a concise conversation summarizer."),
+            HumanMessage(content=prompt)
+        ])
+        return str(res.content).strip()
+    except Exception as exc:
+        logger.warning("[SUMMARY] Rolling summary failed: %s", exc)
+        return current_summary
+
+
 def run_travel_agent(
     user_input: str,
     thread_id: str | None = None,
@@ -215,9 +248,39 @@ def run_travel_agent(
     logger.info("-" * 60)
     start_time = time.time()
 
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # ── Tier 1: Check existing thread state from checkpoint ──
+    existing_constraints = empty_constraints()
+    existing_summary = ""
+    thread_msg_count = 0
+    rolling_summary_triggered = False
+    sliding_window_size = 0
+    constraint_keys_inherited: list[str] = []
+
+    try:
+        checkpoint_state = travel_graph.get_state(config)
+        if checkpoint_state and checkpoint_state.values:
+            existing_constraints = checkpoint_state.values.get("trip_constraints") or empty_constraints()
+            existing_summary = checkpoint_state.values.get("context_summary") or ""
+            existing_messages = checkpoint_state.values.get("messages") or []
+            thread_msg_count = len(existing_messages)
+            sliding_window_size = min(6, thread_msg_count)
+            constraint_keys_inherited = [k for k, v in existing_constraints.items() if v and k != "special_preferences"]
+
+            # Rolling summary if conversation exceeds 10 messages (keeps context window small)
+            if thread_msg_count >= 10:
+                rolling_summary_triggered = True
+                logger.info("[SUMMARY] Thread %s has %d messages. Generating rolling summary...", thread_id, thread_msg_count)
+                existing_summary = _generate_rolling_summary(existing_messages[:-4], existing_summary)
+    except Exception as cp_exc:
+        logger.warning("[CHECKPOINT] Could not read prior thread state: %s", cp_exc)
+
     # ── Tier 2 + Tier 3: Load account profile, Mem0 memories & past trips in parallel ──
     user_profile: dict[str, Any] = {}
     similar_trips: list[dict[str, Any]] = []
+    mem0_hits: int = 0
+    vector_hits: int = 0
     if user_id and user_id != "anonymous":
         with ThreadPoolExecutor(max_workers=3) as executor:
             f_profile = executor.submit(load_user_profile, user_id)
@@ -231,6 +294,7 @@ def run_travel_agent(
 
             try:
                 memories = f_mem0.result() or []
+                mem0_hits = len(memories)
                 if memories:
                     user_profile["mem0_context"] = mem0_format_for_context(memories)
             except Exception as exc:
@@ -238,19 +302,74 @@ def run_travel_agent(
 
             try:
                 similar_trips = f_trips.result() or []
+                vector_hits = len(similar_trips)
             except Exception as exc:
                 logger.warning("[VECTOR] Similar trips failed for user=%s: %s", user_id, exc)
 
     state_input = initial_state(user_input, user_id=user_id, thread_id=thread_id)
     state_input["user_profile"]       = user_profile
     state_input["similar_past_trips"] = similar_trips
+    state_input["trip_constraints"]   = existing_constraints  # Inherit active constraints
+    state_input["context_summary"]    = existing_summary      # Preserve/update running summary
 
-    config = {"configurable": {"thread_id": thread_id}}
+    # ── LLM call accounting per memory tier ──────────────────────────────────
+    # Tier 1 (Sliding Window):       0 LLM calls — pure state slice
+    # Tier 2 (Rolling Summary):      1 LLM call when triggered (thread >= 10 msgs)
+    # Tier 3 (Supervisor/Rewriter):  1 LLM call always (the main supervisor call)
+    #                                (rewriting is piggybacked — 0 EXTRA calls)
+    # Tier 4 (Constraint Inherit):   0 LLM calls — pure state lookup
+    # Mem0 search:                   uses embeddings internally (no generation call)
+    tier_llm_calls = {
+        "sliding_window":     0,                           # zero — pure state slice
+        "rolling_summary":    1 if rolling_summary_triggered else 0,
+        "supervisor_rewriter": 1,                          # always 1 — main supervisor call
+        "constraint_inherit": 0,                           # zero — state lookup
+    }
+    total_memory_llm_calls = sum(tier_llm_calls.values())
+
+    # Store memory trace metadata on state_input for serialization
+    state_input["_memory_trace"] = {
+        "thread_msg_count":          thread_msg_count,
+        "sliding_window_size":       sliding_window_size,
+        "rolling_summary_triggered": rolling_summary_triggered,
+        "rolling_summary_preview":   existing_summary[:200] if existing_summary else "",
+        "constraint_keys_inherited": constraint_keys_inherited,
+        "mem0_hits":                 mem0_hits,
+        "vector_hits":               vector_hits,
+        "has_prior_constraints":     bool(constraint_keys_inherited),
+        "tier_llm_calls":            tier_llm_calls,
+        "total_memory_llm_calls":    total_memory_llm_calls,
+    }
+
+    _memory_trace = state_input.pop("_memory_trace", {})
 
     try:
         result = travel_graph.invoke(state_input, config=config)
         elapsed = time.time() - start_time
         serialized = serialize_result(result, thread_id)
+
+        # Enrich serialized response with memory trace so the UI can visualize it
+        query_intent = serialized.get("query_intent", "travel")
+        resolved = serialized.get("resolved_query", user_input)
+        query_was_rewritten = resolved and resolved.strip().lower() != user_input.strip().lower()
+        _memory_trace["query_was_rewritten"] = query_was_rewritten
+        _memory_trace["resolved_query"] = resolved
+        _memory_trace["original_query"] = user_input
+        _memory_trace["strategy_chosen"] = (
+            "chat_recall"       if query_intent == "chat" else
+            "constraint_reuse"  if _memory_trace.get("has_prior_constraints") and not query_was_rewritten else
+            "coreference"       if query_was_rewritten else
+            "fresh"
+        )
+
+        # If query was rewritten by supervisor, mark the supervisor call as doing double duty
+        if query_was_rewritten:
+            _memory_trace["tier_llm_calls"]["supervisor_rewriter_note"] = (
+                "1 call — rewriting + routing combined (0 extra)"
+            )
+
+        serialized["memory_trace"] = _memory_trace
+
         logger.info("-" * 60)
         intent = serialized.get("query_intent", "travel")
         if intent == "chat":

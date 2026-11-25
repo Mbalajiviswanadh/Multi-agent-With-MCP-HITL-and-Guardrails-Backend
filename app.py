@@ -301,6 +301,20 @@ async def get_history(thread_id: str, page: int = 1, limit: int = 3):
         if not raw_messages:
             return EMPTY
 
+        # Pull thread-level metadata stored in checkpoint state
+        # (These reflect the most recent turn's values — good enough for history display)
+        state_selected_agents  = values.get("selected_agents", [])
+        state_trip_constraints = values.get("trip_constraints", {})
+        state_reasoning        = values.get("supervisor_reasoning", "")
+        state_summary          = values.get("context_summary", "")
+        state_resolved_query   = values.get("resolved_query", "")
+        state_intent           = values.get("query_intent", "travel")
+        state_llm_calls        = values.get("llm_calls", 0)
+        constraint_keys        = [
+            k for k, v in state_trip_constraints.items()
+            if v and k != "special_preferences"
+        ]
+
         # Group messages into trips — each HumanMessage starts a new trip
         trips = []
         current = None
@@ -314,10 +328,18 @@ async def get_history(thread_id: str, page: int = 1, limit: int = 3):
                     "query": msg.content,
                     "answer": "",
                     "answer_preview": "",
+                    # run metadata — populated below from state
+                    "selected_agents":      state_selected_agents,
+                    "trip_constraints":     state_trip_constraints,
+                    "supervisor_reasoning": state_reasoning,
+                    "query_intent":         "travel",
+                    "llm_calls":            0,
+                    "memory_trace":         None,
                 }
             elif cls == "AIMessage" and current:
-                # Only the long final answer (skip short agent hand-off messages)
-                if len(msg.content) > 200:
+                # Only the long final answer (skip short agent hand-off messages),
+                # or capture short chat replies if no answer has been recorded yet.
+                if len(msg.content) > 200 or not current["answer"]:
                     current["answer"] = msg.content
                     current["answer_preview"] = (
                         msg.content[:300].rstrip()
@@ -326,6 +348,55 @@ async def get_history(thread_id: str, page: int = 1, limit: int = 3):
 
         if current:
             trips.append(current)
+
+        # Reconstruct memory_trace for each trip so Chat Memory tab works across thread switches
+        total_trips = len(trips)
+        for idx, trip in enumerate(trips):
+            is_last = (idx == total_trips - 1)
+            prior_msg_count = idx * 2
+            window_size = min(6, prior_msg_count)
+            rolling_triggered = bool(state_summary) and prior_msg_count >= 10
+            has_prior_constraints = idx > 0 and bool(constraint_keys)
+
+            resolved_q = state_resolved_query if (is_last and state_resolved_query) else trip["query"]
+            rewritten = bool(resolved_q and resolved_q.strip().lower() != trip["query"].strip().lower())
+            turn_intent = state_intent if is_last else "travel"
+
+            if is_last:
+                trip["query_intent"] = turn_intent
+                trip["llm_calls"] = state_llm_calls
+
+            summary_calls = 1 if rolling_triggered else 0
+            tier_calls = {
+                "sliding_window":      0,
+                "rolling_summary":     summary_calls,
+                "supervisor_rewriter": 1,
+                "constraint_inherit":  0,
+            }
+            if rewritten:
+                tier_calls["supervisor_rewriter_note"] = "1 call — rewriting + routing combined (0 extra)"
+
+            trip["memory_trace"] = {
+                "thread_msg_count":          prior_msg_count,
+                "sliding_window_size":       window_size,
+                "rolling_summary_triggered": rolling_triggered,
+                "rolling_summary_preview":   state_summary[:200] if rolling_triggered else "",
+                "constraint_keys_inherited": constraint_keys if has_prior_constraints else [],
+                "mem0_hits":                 0,
+                "vector_hits":               0,
+                "has_prior_constraints":     has_prior_constraints,
+                "query_was_rewritten":       rewritten,
+                "resolved_query":            resolved_q,
+                "original_query":            trip["query"],
+                "strategy_chosen": (
+                    "chat_recall"      if turn_intent == "chat" else
+                    "constraint_reuse" if has_prior_constraints and not rewritten else
+                    "coreference"      if rewritten else
+                    "fresh"
+                ),
+                "tier_llm_calls":         tier_calls,
+                "total_memory_llm_calls": 1 + summary_calls,
+            }
 
         # Newest first
         trips.reverse()

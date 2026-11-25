@@ -46,7 +46,7 @@ Return concise travel guidance.
 def flight_agent(state: TravelState) -> dict:
     start_time = time.time()
     logger.info("[FLIGHT_AGENT] -> Running flight search...")
-    query = state["user_query"]
+    query = state.get("resolved_query") or state.get("user_query", "")
 
     try:
         airports = asyncio.run(aviation_mcp_call("list_airports"))

@@ -89,17 +89,22 @@ def run_routing_eval(dataset: list[dict]) -> dict:
 
     SUPERVISOR_PROMPT_TEMPLATE = """\
 You are the supervisor of a multi-agent travel-planning system.
-Choose only the specialist agents needed for the request.
+Analyze the user request and choose ONLY the specialist agents that are strictly needed.
 
 Available agents:
-- flight_agent: flights, airports, airlines, routes, airfare, or booking advice
-- hotel_agent: hotels, accommodation, neighborhoods, or places to stay
-- weather_agent: weather, climate, season, forecast, or packing advice
-- budget_agent: cost, affordability, price limits, or budget feasibility
-- itinerary_agent: creates the integrated travel plan and must always be included
+- flight_agent: ONLY when user asks for flights, airlines, routes, airfare, or flight booking advice.
+- hotel_agent: ONLY when user asks for hotels, accommodation, resorts, neighborhoods, or places to stay.
+- weather_agent: ONLY when user asks for weather, climate, season, forecast, or packing advice.
+- budget_agent: ONLY when user asks about budget feasibility, cost estimation, or price limits.
+- itinerary_agent: ONLY when user asks for a multi-day trip plan, day-by-day itinerary, schedule, tour, or full travel planning.
+
+CRITICAL ROUTING RULES:
+1. SPECIFIC INQUIRIES: If the user is only asking for one specific topic (e.g., "hotels near Guntur railway station", "flights from Delhi to Dubai", "weather in Shimla in December"), select ONLY that specific agent (e.g. ["hotel_agent"]). DO NOT include itinerary_agent unless the user explicitly requested an itinerary or schedule!
+2. COMPLETE TRIP PLANNING: If the user asks for a complete trip, vacation, holiday, or multi-day itinerary (e.g. "Plan a 3-day trip to Goa with flights and hotel under 20k"), select all relevant specialists plus "itinerary_agent".
+3. MINIMAL CALLS: Only select agents that have relevant tools to answer the request. Never call flight_agent or hotel_agent if the user never asked for flights or accommodation.
 
 Return strict JSON only:
-{{"selected_agents": ["agent1", "agent2"], "reasoning": "..."}}
+{{"selected_agents": ["agent1"], "reasoning": "..."}}
 
 User request:
 {query}
@@ -116,10 +121,8 @@ User request:
             ])
             parsed = json_mod.loads(raw.content[raw.content.find("{"):raw.content.rfind("}") + 1])
             selected = set(parsed.get("selected_agents", []))
-            # itinerary_agent is always expected
-            selected.add("itinerary_agent")
 
-            # Allow partial match — count as correct if all expected agents are selected
+            # Match criteria: expected agents must be selected
             if expected_agents.issubset(selected):
                 correct += 1
             else:

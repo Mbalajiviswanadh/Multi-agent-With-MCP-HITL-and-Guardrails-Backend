@@ -58,19 +58,16 @@ def human_approval_agent(state: TravelState) -> dict:
 
 def final_agent(state: TravelState) -> dict:
     start_time = time.time()
-    logger.info("[FINAL_AGENT] -> Polishing final travel plan with user feedback...")
+    selected_agents = list(state.get("selected_agents", []))
+    logger.info("[FINAL_AGENT] -> Generating response for agents: %s", selected_agents)
 
-    if state.get("approved", False):
-        review_instruction = "The user approved the draft. Preserve its decisions while polishing it."
-    else:
-        review_instruction = f"""\
-The user requested a revision. Apply this feedback carefully:
-{state.get('human_feedback', '') or 'Improve the draft before finalizing it.'}
-"""
-
+    user_query = state.get("resolved_query") or state.get("user_query", "")
     feedback_text = state.get("human_feedback", "").lower()
     weather_results = state.get("weather_results", "")
-    selected_agents = list(state.get("selected_agents", []))
+    flight_results = state.get("flight_results", "")
+    hotel_results = state.get("hotel_results", "")
+    budget_results = state.get("budget_results", "")
+    itinerary_draft = state.get("itinerary", "")
 
     # If the user asked for weather in the revision feedback and weather wasn't originally called:
     if ("weather" in feedback_text or "climate" in feedback_text or "forecast" in feedback_text) and not weather_results:
@@ -78,7 +75,7 @@ The user requested a revision. Apply this feedback carefully:
             logger.info("[FINAL_AGENT] -> User requested weather in feedback. Triggering live Weather MCP...")
             city = (
                 state.get("trip_constraints", {}).get("destination")
-                or extract_destination(state.get("user_query", ""))
+                or extract_destination(user_query)
             )
             w_curr = asyncio.run(weather_mcp_search(city))
             w_fc = asyncio.run(forecast_mcp_search(city))
@@ -89,48 +86,95 @@ The user requested a revision. Apply this feedback carefully:
         except Exception as w_exc:
             logger.warning("[FINAL_AGENT] Could not fetch live weather on feedback: %s", w_exc)
 
+    # Determine user approval context
+    is_approved = state.get("approved", False)
+    human_feedback = state.get("human_feedback", "").strip()
+
+    if is_approved:
+        review_context = (
+            "The user approved the draft. Present the approved recommendations clearly and cleanly. "
+            "Preserve all confirmed choices, prices, and specifics from the draft."
+        )
+    elif human_feedback:
+        review_context = f"The user requested changes: '{human_feedback}'. Carefully incorporate this feedback."
+    else:
+        review_context = "Provide a direct, helpful, and beautifully formatted response answering the user request."
+
+    # Build agent-specific context sections
+    has_itinerary = "itinerary_agent" in selected_agents and bool(itinerary_draft)
+    has_hotel = "hotel_agent" in selected_agents or bool(hotel_results)
+    has_flight = "flight_agent" in selected_agents or bool(flight_results)
+    has_weather = "weather_agent" in selected_agents or bool(weather_results)
+    has_budget = "budget_agent" in selected_agents or bool(budget_results)
+
+    sections_instruction = []
+    if has_itinerary:
+        sections_instruction.append("- Trip Overview / Summary")
+        if has_flight:
+            sections_instruction.append("- Flight Options & Recommendations")
+        if has_hotel:
+            sections_instruction.append("- Hotel & Accommodation Options")
+        if has_weather:
+            sections_instruction.append("- Weather & Packing Advice")
+        if has_budget:
+            sections_instruction.append("- Budget Breakdown & Estimates")
+        sections_instruction.append("- Day-by-Day Itinerary")
+        sections_instruction.append("- Practical Travel Tips")
+    else:
+        # Focused single or specialist responses (NO fake itinerary or unrequested sections!)
+        if has_hotel and not has_flight:
+            sections_instruction.append("- Top Recommended Hotels (with proximity, key amenities, estimated rates, and standout features)")
+            sections_instruction.append("- Location / Neighborhood Highlights")
+            sections_instruction.append("- Booking Recommendations & Tips")
+        elif has_flight and not has_hotel:
+            sections_instruction.append("- Flight Routes & Airlines")
+            sections_instruction.append("- Timing, Schedules & Airport Advice")
+            sections_instruction.append("- Booking Tips")
+        elif has_weather:
+            sections_instruction.append("- Current Climate & Forecast Overview")
+            sections_instruction.append("- Recommended Clothing & Packing Essentials")
+            sections_instruction.append("- Best Seasons to Visit")
+        elif has_budget:
+            sections_instruction.append("- Cost Breakdown & Feasibility Assessment")
+            sections_instruction.append("- Budget Saving Tips")
+        else:
+            sections_instruction.append("- Direct, detailed answer to the user's specific request")
+
+    formatting_rules = "\n".join(sections_instruction)
+
+    data_sections = []
+    if has_hotel:
+        data_sections.append(f"### Hotel Search Results:\n{_trim_context(hotel_results, 1500)}")
+    if has_flight:
+        data_sections.append(f"### Flight Search Results:\n{_trim_context(flight_results, 1500)}")
+    if has_weather:
+        data_sections.append(f"### Weather Results:\n{_trim_context(weather_results, 1000)}")
+    if has_budget:
+        data_sections.append(f"### Budget Analysis:\n{_trim_context(budget_results, 1200)}")
+    if has_itinerary:
+        data_sections.append(f"### Draft Itinerary:\n{_trim_context(itinerary_draft, 2000)}")
+
+    retrieved_data_str = "\n\n".join(data_sections) if data_sections else "No specialist tool output."
+
     final_prompt = f"""\
-Generate the final travel response for the user.
+You are TripMate AI, a professional and helpful travel assistant.
+Generate the response strictly tailored to what the user asked.
 
-Human Review:
-{review_instruction}
+USER REQUEST:
+{user_query}
 
-User Request:
-{state['user_query']}
+REVIEW STATUS:
+{review_context}
 
-Supervisor Constraints:
-{state.get('trip_constraints', {})}
+RETRIEVED SPECIALIST DATA:
+{retrieved_data_str}
 
-Flights:
-{_trim_context(state.get('flight_results', ''), 1200)}
-
-Hotels:
-{_trim_context(state.get('hotel_results', ''), 1200)}
-
-Weather:
-{_trim_context(weather_results, 1000)}
-
-Budget Analysis:
-{_trim_context(state.get('budget_results', ''), 1200)}
-
-Draft Itinerary:
-{_trim_context(state.get('itinerary', ''), 2000)}
-
-Format the final answer beautifully using these sections:
-1. Trip Summary
-2. Flight Information
-3. Hotel Suggestions
-4. Weather Information
-5. Day-by-Day Itinerary
-6. Estimated Budget
-7. Final Recommendations
-
-Important:
-- Be clear and practical.
-- Mention that live flight APIs may not provide ticket prices when pricing is unavailable.
-- Include weather-based travel advice.
-- Keep the response useful for real travel planning.
-- Incorporate the human feedback when revision was requested.
+STRICT FORMATTING REQUIREMENTS:
+1. ONLY discuss information that was requested by the user or retrieved in the data above.
+2. DO NOT invent or include sections for unrequested categories (e.g., NEVER add a 'Flight Information' section if no flight search was requested or performed).
+3. Structure your response cleanly using these relevant sections:
+{formatting_rules}
+4. Write in a warm, professional, and clear tone with markdown formatting (bullet points, bold highlights).
 """
 
     try:

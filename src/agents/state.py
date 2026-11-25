@@ -23,6 +23,7 @@ class TravelState(TypedDict, total=False):
     # ── Short-Term Working Memory ─────────────────────────────────────────
     messages: Annotated[list[AnyMessage], operator.add]
     user_query: str
+    resolved_query: str        # Coreference-resolved / disambiguated query
     # Condensed summary of old messages — prevents token overflow across
     # long multi-turn sessions without losing context
     context_summary: str
@@ -82,6 +83,7 @@ def initial_state(user_query: str, user_id: str = "anonymous", thread_id: str = 
         "thread_id": thread_id,
         "messages": [HumanMessage(content=user_query)],
         "user_query": user_query,
+        "resolved_query": user_query,
         "context_summary": "",
         "user_profile": {},
         "similar_past_trips": [],
