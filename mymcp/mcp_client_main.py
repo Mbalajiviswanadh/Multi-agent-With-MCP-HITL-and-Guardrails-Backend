@@ -15,7 +15,9 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+# Load from project root .env first, then fallback to mymcp/.env if it exists
+load_dotenv(BASE_DIR.parent / ".env")   # project root (primary)
+load_dotenv(BASE_DIR / ".env")          # mymcp subfolder (override, if present)
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
@@ -31,7 +33,7 @@ AVIATION_STACK_API_KEY = (
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-WEATHER_SERVER_PATH = BASE_DIR / "custom_weather_mcp_server.py"
+WEATHER_SERVER_PATH = BASE_DIR / "custom_weather_mcp.py"
 UVX_COMMAND = shutil.which("uvx") or "uvx"
 
 

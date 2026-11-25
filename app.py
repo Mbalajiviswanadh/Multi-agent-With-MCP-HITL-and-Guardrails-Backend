@@ -3,7 +3,7 @@ import traceback
 import uvicorn
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -12,6 +12,8 @@ from fastapi.templating import Jinja2Templates
 
 from src.agents.graph import run_travel_agent, travel_graph, resume_travel_agent
 from src.api.routers.threads import router as threads_router
+from src.api.routers.auth import router as auth_router
+from src.api.dependencies import get_current_user, get_optional_current_user
 from src.memory.profile_store import run_schema_migrations
 from src.memory.vector_store import run_vector_schema_migrations
 from src.memory.mem0_service import mem0_get_all, mem0_delete_user
@@ -83,8 +85,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register chatbot sidebar threads API
+# Register Routers
 app.include_router(threads_router)
+app.include_router(auth_router)
 
 
 # =========================
@@ -108,7 +111,10 @@ class ApprovalRequest(BaseModel):
 # =========================
 
 @app.post("/api/travel")
-async def travel_planner(request_data: TravelRequest):
+async def travel_planner(
+    request_data: TravelRequest,
+    current_user: dict | None = Depends(get_optional_current_user),
+):
     try:
         user_message = request_data.message.strip()
 
@@ -121,15 +127,19 @@ async def travel_planner(request_data: TravelRequest):
                 },
             )
 
+        # Infer user_id from verified JWT token if authenticated, else request_data.user_id
+        effective_user_id = (current_user["id"] if current_user else None) or request_data.user_id or "anonymous"
+
         result = run_travel_agent(
             user_input=user_message,
             thread_id=request_data.thread_id,
-            user_id=request_data.user_id,
+            user_id=effective_user_id,
         )
 
         return JSONResponse(
             content={
                 "success": True,
+                "user_id": effective_user_id,
                 **result,
             }
         )
@@ -147,7 +157,10 @@ async def travel_planner(request_data: TravelRequest):
         )
 
 @app.post("/api/travel/approve")
-async def approve_travel_plan(request_data: ApprovalRequest):
+async def approve_travel_plan(
+    request_data: ApprovalRequest,
+    current_user: dict | None = Depends(get_optional_current_user),
+):
     try:
         if not request_data.approved and not request_data.feedback.strip():
             return JSONResponse(
@@ -158,16 +171,19 @@ async def approve_travel_plan(request_data: ApprovalRequest):
                 },
             )
 
+        effective_user_id = (current_user["id"] if current_user else None) or request_data.user_id or "anonymous"
+
         result = resume_travel_agent(
             thread_id=request_data.thread_id,
             approved=request_data.approved,
             feedback=request_data.feedback,
-            user_id=request_data.user_id,
+            user_id=effective_user_id,
         )
 
         return JSONResponse(
             content={
                 "success": True,
+                "user_id": effective_user_id,
                 **result,
             }
         )
@@ -207,30 +223,38 @@ async def health_check():
 # =========================
 
 @app.get("/api/memory/{user_id}")
-async def get_user_memories(user_id: str):
+async def get_user_memories(
+    user_id: str,
+    current_user: dict | None = Depends(get_optional_current_user),
+):
     """
     Retrieve all Mem0 memories for a user.
-    Useful for inspecting what TripMate has learned about the user.
-
-    Example:
-        GET /api/memory/viswanadh_01
+    If authenticated, ensures user can only view their own memories.
     """
-    memories = mem0_get_all(user_id)
+    effective_user_id = (current_user["id"] if current_user else None) or user_id
+    if current_user and current_user["id"] != user_id and user_id != "anonymous":
+        raise HTTPException(status_code=403, detail="Forbidden: Cannot view another user's memories.")
+
+    memories = mem0_get_all(effective_user_id)
     return {
-        "user_id": user_id,
+        "user_id": effective_user_id,
         "total": len(memories),
         "memories": memories,
     }
 
 
 @app.delete("/api/memory/{user_id}")
-async def delete_user_memories(user_id: str):
+async def delete_user_memories(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Delete all Mem0 memories for a user (GDPR right-to-be-forgotten).
-
-    Example:
-        DELETE /api/memory/viswanadh_01
+    Requires valid JWT authentication.
     """
+    if current_user["id"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden: Cannot delete another user's memories.")
+
     success = mem0_delete_user(user_id)
     return {
         "user_id": user_id,

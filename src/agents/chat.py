@@ -27,7 +27,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.agents.state import TravelState
 from src.core.logging_config import get_logger
-from src.memory.mem0_service import mem0_add, mem0_search, mem0_format_for_context
+from src.memory.mem0_service import mem0_add_async, mem0_get_user_context, mem0_format_for_context
 from src.reliability.llm_factory import resilient_llm
 
 logger = get_logger("TripMateAI.agents.chat")
@@ -57,16 +57,32 @@ def chat_agent(state: TravelState) -> dict:
 
     logger.info("[CHAT_AGENT] -> Handling conversation for user=%s", user_id)
 
-    # ── 1. Retrieve relevant Mem0 memories to personalise the reply ─────────
-    memory_context = ""
-    if user_id and user_id != "anonymous":
-        memories = mem0_search(query, user_id=user_id, top_k=5)
-        memory_context = mem0_format_for_context(memories)
+    # ── 1. Build account + Mem0 context (reuse pre-loaded state; zero duplicate search) ──
+    user_profile = state.get("user_profile") or {}
+    context_parts: list[str] = []
 
-    # ── 2. Build system prompt (inject memory context if available) ─────────
+    if user_profile.get("name"):
+        context_parts.append(f"Account user name: {user_profile['name']}")
+    if user_profile.get("home_airport"):
+        context_parts.append(f"Home airport: {user_profile['home_airport']}")
+    if user_profile.get("preferred_travel_style"):
+        context_parts.append(f"Preferred travel style: {user_profile['preferred_travel_style']}")
+
+    mem0_context = user_profile.get("mem0_context", "")
+    if not mem0_context and user_id and user_id != "anonymous" and not user_profile:
+        # Fallback only if chat_agent was invoked directly without run_travel_agent
+        memories = mem0_get_user_context(query, user_id=user_id, top_k=5)
+        mem0_context = mem0_format_for_context(memories)
+
+    if mem0_context:
+        context_parts.append(mem0_context)
+
+    memory_context = "\n".join(context_parts)
+
+    # ── 2. Build system prompt (inject account + memory context if available) ──
     system_content = _CHAT_SYSTEM
     if memory_context:
-        system_content += f"\n\n{memory_context}"
+        system_content += f"\n\nKnown User Context:\n{memory_context}"
 
     # ── 3. Generate conversational reply ────────────────────────────────────
     try:
@@ -84,17 +100,13 @@ def chat_agent(state: TravelState) -> dict:
             "How can I help you plan your next trip?"
         )
 
-    # ── 4. Store this conversation turn in Mem0 (async-safe, non-blocking) ──
-    # Mem0 auto-extracts facts (name, preferences, city) from the conversation
-    # and self-evolves conflicting memories — no manual JSON parsing needed.
+    # ── 4. Store user facts at ACCOUNT level in background (non-blocking) ────
+    # Omit run_id so facts are shared across ALL threads for this user_id,
+    # and send only the user's message to keep Mem0 extraction well under TPM limits.
     if user_id and user_id != "anonymous":
-        mem0_add(
-            messages=[
-                {"role": "user",      "content": query},
-                {"role": "assistant", "content": reply},
-            ],
+        mem0_add_async(
+            messages=[{"role": "user", "content": query}],
             user_id=user_id,
-            run_id=thread_id or None,
         )
 
     elapsed = time.time() - start_time

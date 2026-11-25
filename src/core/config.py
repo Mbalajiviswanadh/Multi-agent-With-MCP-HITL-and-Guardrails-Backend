@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     qdrant_url: str = ""
     qdrant_api_key: str = ""
 
+    # --- Security & JWT Authentication ---
+    jwt_secret_key: str = "tripmate_production_jwt_secret_key_change_in_env_super_secure_99"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 60 * 24 * 7  # 7 days expiration
+
     # --- CORS ---
     allowed_origins: str = "http://localhost:3000,http://localhost:5173"
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from langgraph.graph import StateGraph, START, END
@@ -44,9 +45,11 @@ from src.core.logging_config import get_logger
 from src.memory.checkpointer import get_checkpointer
 from src.memory.mem0_service import (
     mem0_search,
+    mem0_get_user_context,
     mem0_add,
     mem0_format_for_context,
 )
+from src.memory.profile_store import load_user_profile
 from src.memory.vector_store import store_trip_embedding, find_similar_trips
 from src.reliability.retry_policy import MCP_RETRY_POLICY, LLM_RETRY_POLICY
 
@@ -212,22 +215,31 @@ def run_travel_agent(
     logger.info("-" * 60)
     start_time = time.time()
 
-    # ── Tier 2: Load Mem0 memories (replaces manual SQL profile read) ───────
+    # ── Tier 2 + Tier 3: Load account profile, Mem0 memories & past trips in parallel ──
     user_profile: dict[str, Any] = {}
-    mem0_context = ""
+    similar_trips: list[dict[str, Any]] = []
     if user_id and user_id != "anonymous":
-        memories = mem0_search(user_input, user_id=user_id, top_k=5)
-        mem0_context = mem0_format_for_context(memories)
-        # Map to legacy user_profile dict for specialist agents that use it
-        if memories:
-            user_profile["mem0_context"] = mem0_context
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            f_profile = executor.submit(load_user_profile, user_id)
+            f_mem0 = executor.submit(mem0_get_user_context, user_input, user_id, 5)
+            f_trips = executor.submit(find_similar_trips, user_id, user_input, 2)
 
-    # ── Tier 3: Fetch semantically similar past trips from pgvector ──────────
-    similar_trips = (
-        find_similar_trips(user_id, user_input, top_k=2)
-        if user_id and user_id != "anonymous"
-        else []
-    )
+            try:
+                user_profile = f_profile.result() or {}
+            except Exception as exc:
+                logger.warning("[PROFILE] Failed to load profile for user=%s: %s", user_id, exc)
+
+            try:
+                memories = f_mem0.result() or []
+                if memories:
+                    user_profile["mem0_context"] = mem0_format_for_context(memories)
+            except Exception as exc:
+                logger.warning("[MEM0] Context load failed for user=%s: %s", user_id, exc)
+
+            try:
+                similar_trips = f_trips.result() or []
+            except Exception as exc:
+                logger.warning("[VECTOR] Similar trips failed for user=%s: %s", user_id, exc)
 
     state_input = initial_state(user_input, user_id=user_id, thread_id=thread_id)
     state_input["user_profile"]       = user_profile

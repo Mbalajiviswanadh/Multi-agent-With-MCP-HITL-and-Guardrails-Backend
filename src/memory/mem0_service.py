@@ -34,6 +34,7 @@ Public API (used by chat.py and graph.py):
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +72,7 @@ def _build_mem0_config() -> dict:
                 "model": "openai/gpt-oss-20b",      # Fast, high TPM model available on your Groq key
                 "api_key": settings.groq_api_key,
                 "temperature": 0.1,                  # Low temp for factual extraction
-                "max_tokens": 1000,
+                "max_tokens": 256,                   # Keep under Groq 8k TPM reservation limit
             },
         },
         "embedder": {
@@ -114,7 +115,7 @@ def _get_mem0():
         _mem0_instance = Memory.from_config(config)
         dest = settings.qdrant_url if settings.qdrant_url else _QDRANT_LOCAL_PATH
         logger.info(
-            "[MEM0] Initialized | LLM: Groq/llama-3.1-8b-instant | "
+            "[MEM0] Initialized | LLM: Groq/openai/gpt-oss-20b | "
             "Embedder: FastEmbed/all-MiniLM-L6-v2 (384-dim) | "
             "Store: Qdrant Cloud @ %s",
             dest,
@@ -187,6 +188,42 @@ def mem0_add(
         return False
 
 
+def mem0_add_async(
+    messages: list[dict[str, str]] | str,
+    user_id: str,
+    run_id: str | None = None,
+) -> None:
+    """
+    Non-blocking wrapper around mem0_add() for low-latency chat responses.
+    Runs fact extraction and Qdrant upsert in a background daemon thread.
+    """
+    thread = threading.Thread(
+        target=mem0_add,
+        kwargs={"messages": messages, "user_id": user_id, "run_id": run_id},
+        daemon=True,
+    )
+    thread.start()
+
+
+def mem0_get_user_context(
+    query: str,
+    user_id: str,
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    """
+    Fast account-level memory retrieval:
+      1. Runs semantic search for `query` scoped to `user_id` + `agent_id`.
+      2. If semantic search returns nothing (e.g. short/typo/general query like
+         'hi' or 'do you know myname?'), falls back to mem0_get_all(user_id)
+         so core account facts (name, preferences) are always available.
+    """
+    memories = mem0_search(query, user_id=user_id, top_k=top_k)
+    if memories:
+        return memories
+    all_memories = mem0_get_all(user_id)
+    return all_memories[:top_k] if all_memories else []
+
+
 def mem0_search(
     query: str,
     user_id: str,
@@ -255,7 +292,8 @@ def mem0_delete_user(user_id: str) -> bool:
         return False
 
     try:
-        mem0.delete_all(filters={"user_id": user_id, "agent_id": "tripmate_ai"})
+        # Mem0 delete_all accepts user_id as a direct kwarg (not via filters)
+        mem0.delete_all(user_id=user_id)
         logger.info("[MEM0] Deleted all memories for user=%s", user_id)
         return True
 

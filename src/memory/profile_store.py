@@ -23,11 +23,14 @@ logger = get_logger("TripMateAI.memory.profile")
 # SQL to run once at startup (safe with IF NOT EXISTS)
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-    id          VARCHAR(64) PRIMARY KEY,
-    name        VARCHAR(128),
-    email       VARCHAR(128) UNIQUE,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    id             VARCHAR(64) PRIMARY KEY,
+    name           VARCHAR(128),
+    email          VARCHAR(128) UNIQUE,
+    password_hash  VARCHAR(255),
+    created_at     TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
 
 CREATE TABLE IF NOT EXISTS user_profiles (
     user_id                 VARCHAR(64) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -74,25 +77,33 @@ def ensure_user_exists(user_id: str, name: str = "", email: str = "") -> None:
 
 def load_user_profile(user_id: str) -> dict[str, Any]:
     """
-    Load the user's long-term profile.
-    Returns an empty dict for first-time users (no profile yet).
+    Load the user's account info and long-term profile in a single fast query.
+    Returns an empty dict if the user does not exist.
     """
     pool = get_pool()
     with pool.connection() as conn:
         row = conn.execute(
-            "SELECT * FROM user_profiles WHERE user_id = %s",
+            """
+            SELECT u.id AS user_id, u.name, u.email,
+                   p.home_airport, p.preferred_travel_style,
+                   p.dietary_preferences, p.frequent_airlines,
+                   p.hotel_preferences, p.custom_notes, p.updated_at
+            FROM users u
+            LEFT JOIN user_profiles p ON u.id = p.user_id
+            WHERE u.id = %s
+            """,
             (user_id,),
         ).fetchone()
 
     if row is None:
-        logger.debug("[PROFILE] No profile found for user_id=%s (new user)", user_id)
+        logger.debug("[PROFILE] No user/profile found for user_id=%s", user_id)
         return {}
 
     profile = dict(row)
     logger.info(
-        "[PROFILE] Loaded profile for user_id=%s: style=%s, airport=%s",
+        "[PROFILE] Loaded account+profile for user_id=%s (name=%s, airport=%s)",
         user_id,
-        profile.get("preferred_travel_style"),
+        profile.get("name"),
         profile.get("home_airport"),
     )
     return profile

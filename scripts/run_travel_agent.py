@@ -1,4 +1,4 @@
-from backend import run_travel_agent
+from src.agents.graph import run_travel_agent
 
 user_input = input("Enter travel request: ")
 

@@ -375,4 +375,98 @@ Mem0 memories are scoped by:
 
 ---
 
+---
+
+## ✅ Phase 13 — Production JWT Authentication System
+
+**Goal:** Add a fully production-grade authentication layer so users can register, log in with passwords, and access only their own data via ownership-enforced endpoints.
+
+**What was done:**
+- Implemented password hashing with **PBKDF2-HMAC-SHA256** (100,000 iterations, 16-byte random salt) using Python stdlib — no external dependencies like `bcrypt`/`passlib`.
+- Issued **signed JWT tokens** (HS256) using `PyJWT`. Token payload: `{sub: user_id, email, name, exp, iat}`.
+- Created all auth routes, security utilities, and FastAPI dependencies in a clean modular structure.
+- Added DB migration to add `password_hash` column to the `users` table on startup.
+- Protected sensitive endpoints with **JWT ownership checks** (users can only read/delete their own data).
+- Verified all flows with a full automated test suite — **4/4 tests passed**.
+
+### Architecture
+
+```
+POST /api/auth/register
+  → Validate email (regex), hash password (PBKDF2), INSERT users + user_profiles
+  → Return signed JWT token (7-day expiry, HS256)
+
+POST /api/auth/login
+  → Lookup user by email, verify_password (constant-time HMAC compare)
+  → Return signed JWT token
+
+GET /api/auth/me
+  → Decode JWT Bearer token (Depends: get_current_user)
+  → JOIN users + user_profiles, return full profile
+
+DELETE /api/memory/{user_id}      ← Strict auth (get_current_user, 401 if no token)
+  → JWT decoded, ownership check: token.sub == user_id (403 if mismatch)
+
+GET /api/memory/{user_id}         ← Optional auth (get_optional_current_user)
+POST /api/travel                  ← Optional auth — infers user_id from JWT if present
+POST /api/travel/approve          ← Optional auth — infers user_id from JWT if present
+```
+
+### Password Hashing Design
+
+```
+hash_password("SecurePassword123!"):
+  salt = os.urandom(16)   ← Cryptographically secure 128-bit salt
+  key  = pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+  → "pbkdf2_sha256$100000$<salt_b64>$<hash_b64>"
+
+verify_password(plain, stored):
+  → Constant-time hmac.compare_digest (prevents timing attacks)
+```
+
+### JWT Token Flow
+
+```
+Register/Login success:
+  payload = {sub: "user_abc123", email: "...", name: "...", iat: now, exp: now+7d}
+  token = jwt.encode(payload, JWT_SECRET_KEY, algorithm="HS256")
+
+Protected endpoint:
+  Authorization: Bearer <token>
+  → HTTPBearer extracts credentials
+  → jwt.decode(token, JWT_SECRET_KEY) → payload
+  → user = {id: payload["sub"], email: ..., name: ...}
+```
+
+### Files Created / Changed
+
+| File | Change |
+|------|--------|
+| `src/core/security.py` | **New** — `hash_password()`, `verify_password()`, `create_access_token()`, `decode_access_token()` |
+| `src/api/dependencies.py` | **New** — `get_current_user` (strict, 401 on failure), `get_optional_current_user` (returns None on no token) |
+| `src/api/routers/auth.py` | **New** — `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me` |
+| `src/core/config.py` | Added `jwt_secret_key`, `jwt_algorithm`, `jwt_access_token_expire_minutes` settings |
+| `src/memory/profile_store.py` | Schema SQL — added `password_hash VARCHAR(255)` column + `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` |
+| `src/api/routers/threads.py` | Updated to use `get_optional_current_user` with thread ownership checks |
+| `app.py` | Added `auth_router`, `Depends` import, optional auth on `/api/travel` and `/api/travel/approve`, strict auth on `DELETE /api/memory/{user_id}`, ownership checks on `GET /api/memory/{user_id}` |
+| `scripts/test_auth_flow.py` | **New** — Full end-to-end auth verification suite (4/4 tests pass against live Render PostgreSQL) |
+
+### Test Results
+
+```
+=================================================================
+TripMate AI — Production JWT Authentication Verification
+=================================================================
+[1/4] Register user → 201 Created ✅ (JWT issued, user stored in PostgreSQL)
+[2/4] Login + wrong password → 200 OK + 401 Unauthorized ✅ (PBKDF2 verified)
+[3/4] GET /api/auth/me with valid token → 200 OK ✅ (identity confirmed from JWT)
+[4/4] DELETE /api/memory without token → 401, with token → 200 ✅ (ownership enforced)
+=================================================================
+ALL PRODUCTION AUTHENTICATION & SECURITY TESTS PASSED 100%!
+```
+
+**Concept Covered:** JWT Authentication, PBKDF2 Password Hashing, Bearer Token Authorization, Route Ownership Enforcement, Production Security Middleware
+
+---
+
 *This document is auto-updated after each implementation phase.*

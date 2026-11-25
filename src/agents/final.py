@@ -15,6 +15,8 @@ from src.agents.state import TravelState
 from src.core.logging_config import get_logger
 from src.guardrails.output_guardrail import check_output
 from src.reliability.llm_factory import resilient_llm
+from mymcp.mcp_client_main import extract_destination, weather_mcp_search, forecast_mcp_search
+import asyncio
 
 logger = get_logger("TripMateAI.agents.final")
 
@@ -66,6 +68,27 @@ The user requested a revision. Apply this feedback carefully:
 {state.get('human_feedback', '') or 'Improve the draft before finalizing it.'}
 """
 
+    feedback_text = state.get("human_feedback", "").lower()
+    weather_results = state.get("weather_results", "")
+    selected_agents = list(state.get("selected_agents", []))
+
+    # If the user asked for weather in the revision feedback and weather wasn't originally called:
+    if ("weather" in feedback_text or "climate" in feedback_text or "forecast" in feedback_text) and not weather_results:
+        try:
+            logger.info("[FINAL_AGENT] -> User requested weather in feedback. Triggering live Weather MCP...")
+            city = (
+                state.get("trip_constraints", {}).get("destination")
+                or extract_destination(state.get("user_query", ""))
+            )
+            w_curr = asyncio.run(weather_mcp_search(city))
+            w_fc = asyncio.run(forecast_mcp_search(city))
+            weather_results = f"Current Weather:\n{w_curr}\n\nForecast:\n{w_fc}"
+            if "weather_agent" not in selected_agents:
+                selected_agents.append("weather_agent")
+            logger.info("[FINAL_AGENT] OK Live weather retrieved for %s", city)
+        except Exception as w_exc:
+            logger.warning("[FINAL_AGENT] Could not fetch live weather on feedback: %s", w_exc)
+
     final_prompt = f"""\
 Generate the final travel response for the user.
 
@@ -85,7 +108,7 @@ Hotels:
 {_trim_context(state.get('hotel_results', ''), 1200)}
 
 Weather:
-{_trim_context(state.get('weather_results', ''), 1000)}
+{_trim_context(weather_results, 1000)}
 
 Budget Analysis:
 {_trim_context(state.get('budget_results', ''), 1200)}
@@ -138,6 +161,8 @@ Important:
 
     return {
         "final_response": final_response_content,
+        "weather_results": weather_results,
+        "selected_agents": selected_agents,
         "messages": [msg],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
