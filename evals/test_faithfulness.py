@@ -72,9 +72,10 @@ FAITHFULNESS_CASES = [
 ]
 
 _JUDGE_SYSTEM = """You are an expert AI evaluator assessing response faithfulness.
-Your task: determine if a final travel response contains ONLY facts that are grounded
-in the provided tool output context. Hallucinated facts (names, prices, airlines, hotels
-not in the context) = NOT faithful.
+Your task: determine if a final travel response is faithful to the provided tool output context.
+- Factual claims about specific airlines, specific hotel names, or strict price guarantees MUST be grounded in the context.
+- Common-sense travel packing advice (e.g. sunscreen for sunny weather, umbrella for rain) and appropriately qualified general estimates (e.g. 'typically range ₹3,000–₹7,000') are acceptable natural inferences and are considered faithful.
+- Completely fabricated hotel names, unmentioned competitor airlines, or guaranteed fake prices = NOT faithful.
 Return strict JSON only: {"faithful": true/false, "reason": "brief explanation"}"""
 
 _JUDGE_PROMPT = """

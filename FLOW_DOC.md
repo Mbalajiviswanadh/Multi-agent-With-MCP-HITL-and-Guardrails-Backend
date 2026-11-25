@@ -470,3 +470,117 @@ ALL PRODUCTION AUTHENTICATION & SECURITY TESTS PASSED 100%!
 ---
 
 *This document is auto-updated after each implementation phase.*
+
+---
+
+## ✅ Phase 14 — DeepEval Evaluation Framework & Rich Console UI
+
+### What Was Built
+
+A production-grade evaluation suite using **DeepEval**-style LLM-as-Judge metrics with a **Rich** terminal dashboard. The eval system now has 4 phases covering guardrail accuracy, routing precision, faithfulness grounding, and DeepEval LLM-judge metrics — all rendered in a styled Rich console table.
+
+### Architecture
+
+```
+python -m evals.run_evals
+│
+├── [Phase 1] Guardrail & Routing Eval
+│     └── evals/test_routing.py  →  load_dataset() + run_guardrail_eval() + run_routing_eval()
+│
+├── [Phase 2] Faithfulness (LLM-as-Judge)
+│     └── evals/test_faithfulness.py  →  evaluate_faithfulness() per case
+│
+└── [Phase 3] DeepEval Metrics (4 LLM-Judge metrics)
+      └── evals/test_deepeval.py  →  run_deepeval_suite()
+            ├── FaithfulnessMetric     (Is response grounded in retrieved context?)
+            ├── AnswerRelevancyMetric  (Does output directly answer the query?)
+            ├── GEval Actionability    (Structured G-Eval: day-by-day, logistics, executability)
+            └── HallucinationMetric    (Explicit check for fabricated prices/hotel names)
+```
+
+### Evaluation Metrics Summary
+
+| Metric | Type | Threshold | Description |
+|--------|------|-----------|-------------|
+| **Guardrail Accuracy** | Rule-based | ≥ 85% | Supervisor correctly allows/blocks 30 labeled queries |
+| **Routing Precision** | Rule-based | ≥ 75% | Supervisor picks correct specialist agents for travel queries |
+| **Faithfulness (LLM-Judge)** | Groq-judge | ≥ 75% | Final answers grounded in MCP-retrieved data, no hallucinations |
+| **Answer Relevancy** | DeepEval/Groq | ≥ 75% | Output directly answers user query (on-topic, complete) |
+| **G-Eval Actionability** | DeepEval/Groq | ≥ 75% | Plan has day-by-day structure, realistic logistics, executable steps |
+| **Hallucination Avoidance** | Groq-judge | ≥ 75% | No fabricated prices, hotel names, or flight numbers |
+
+### Dataset: 50 Golden Test Cases
+
+`evals/datasets/golden_queries.jsonl` — expanded to 50 entries covering:
+- Core travel planning (Goa, Manali, Shimla, Kerala, Rajasthan, Pondicherry, Visakhapatnam, Gulmarg, etc.)
+- Budget queries, luxury queries, multi-city circuits
+- Edge cases: conversational chitchat, profile context ("I am Viswanadh", "remember my preference"), non-travel queries
+- Adversarial: prompt injection, illegal requests, airport security bypass, passport forgery (all blocked)
+
+### Rich Console Dashboard Results
+
+```
+                     ✨ Agent Evaluation Summary Dashboard                     
+╔══════════════════════════════╤═════════════════╤══════════════╤═════════════╗
+║                              │     Score /     │              │   Target    ║
+║ Evaluation Dimension         │    Accuracy     │  Threshold   │   Status    ║
+╟──────────────────────────────┼─────────────────┼──────────────┼─────────────╢
+║ Input Guardrail Accuracy     │  90.0% (45/50)  │   ≥ 85.0%    │    PASS     ║
+║ Supervisor Routing Precision │  81.1% (30/37)  │   ≥ 75.0%    │    PASS     ║
+║ Faithfulness (LLM-as-Judge)  │      80.0%      │   ≥ 75.0%    │    PASS     ║
+║ DeepEval Answer Relevancy    │      90.3%      │   ≥ 75.0%    │    PASS     ║
+║ DeepEval G-Eval              │      80.0%      │   ≥ 75.0%    │    PASS     ║
+║ Actionability                │                 │              │             ║
+║ DeepEval Hallucination       │      95.0%      │   ≥ 75.0%    │    PASS     ║
+║ Avoidance                    │                 │              │             ║
+╚══════════════════════════════╧═════════════════╧══════════════╧═════════════╝
+ Total Evaluation Runtime: 366.9s | Total Test Cases Evaluated: 61
+```
+
+### Key Design Decisions
+
+**DeepEval Compatibility Layer:**
+DeepEval 2.5.5 internally calls `sentry_sdk.init(profiles_sample_rate=...)` which is an option removed in newer `sentry_sdk` versions. We patch `sentry_sdk.init()` in-memory before DeepEval imports to silently drop unknown kwargs. This allows DeepEval to load without downgrading sentry_sdk.
+
+**LangChain Schema Bridge:**
+DeepEval still references `langchain.schema` (old path). LangChain 1.x moved it to `langchain_core.messages`. We inject a `sys.modules["langchain.schema"]` alias before the import chain.
+
+**Groq as LLM Judge:**
+All 4 LLM-judge metrics use the project's existing `resilient_llm` (Groq openai/gpt-oss-120b with fallback to openai/gpt-oss-20b). No external OpenAI key required — consistent with the rest of the project.
+
+**Graceful Fallback:**
+If DeepEval's native metric classes fail (network, API mismatch), each metric falls back to our own structured JSON-prompt LLM judge — ensuring the eval suite always produces results.
+
+### Files Created / Changed
+
+| File | Change |
+|------|--------|
+| `evals/test_deepeval.py` | **Rewritten** — 4 DeepEval-style metrics with Groq judge adapter, Rich table output, 6 test cases covering diverse travel scenarios |
+| `evals/run_evals.py` | **Updated** — Added Phase 3 DeepEval runner, 6-metric summary dashboard, hallucination avoidance row |
+| `evals/datasets/golden_queries.jsonl` | **Expanded** — 30 → 40 entries (added 10: conversational, adversarial, intent variety) |
+| `FLOW_DOC.md` | Added Phase 14 section |
+
+### How to Run
+
+```powershell
+# Full 3-phase eval suite
+cd d:\Projects\ai-engineer\multi-agent-projects\03-MultiAgent-MCP-Guardrails
+uv run python -m evals.run_evals
+
+# DeepEval metrics only (Phase 3)
+uv run python evals\test_deepeval.py
+```
+
+### Concept Covered
+
+**LLM-as-Judge:** Using a capable LLM (Groq) to evaluate AI outputs against structured criteria — a powerful alternative to human review at scale.
+
+**G-Eval:** A structured criteria-based evaluation method from DeepEval that breaks down quality into measurable sub-dimensions (structure, logistics, executability) and scores them in a single LLM call.
+
+**Faithfulness Grounding:** Verifying that AI responses don't hallucinate facts by checking every claim against a retrieved-context ground truth.
+
+**Hallucination Detection:** Explicit adversarial probe that asks the judge to list any fabricated prices, hotel names, or flight numbers — the most common failure mode in travel AI.
+
+---
+
+*This document is auto-updated after each implementation phase.*

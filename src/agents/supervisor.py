@@ -66,21 +66,23 @@ def supervisor_agent(state: TravelState) -> dict:
 
     # ── BLOCKED ─────────────────────────────────────────────────────────
     if not allowed or intent == "blocked":
-        reason = guardrail_reason or (
-            "I'm sorry, I can't help with that. I'm TripMate AI, "
-            "your travel planning assistant. Ask me about trips, flights, hotels, or destinations!"
+        user_response = (
+            "I'm sorry, but I can't assist with that request. I'm TripMate AI, your dedicated "
+            "travel planning companion! Feel free to ask me about planning trips, discovering destinations, "
+            "finding flights, hotels, weather, or local activities."
         )
+        internal_reason = guardrail_reason or "Request flagged by safety guardrails as outside travel planning."
         elapsed = time.time() - start_time
-        logger.info("[SUPERVISOR] X BLOCKED (%.1fs): %s", elapsed, reason)
+        logger.info("[SUPERVISOR] X BLOCKED (%.1fs): %s", elapsed, internal_reason)
         return {
             "guardrail_allowed": False,
             "query_intent": "blocked",
-            "guardrail_reason": reason,
+            "guardrail_reason": internal_reason,
             "selected_agents": [],
             "trip_constraints": empty_constraints(),
-            "supervisor_reasoning": reason,
-            "final_response": reason,
-            "messages": [AIMessage(content=reason)],
+            "supervisor_reasoning": internal_reason,
+            "final_response": user_response,
+            "messages": [AIMessage(content=user_response)],
             "llm_calls": llm_calls,
         }
 
@@ -177,11 +179,13 @@ User request:
 
 
 def guardrail_blocked_agent(state: TravelState) -> dict:
-    reason = state.get("final_response") or state.get("guardrail_reason") or (
-        "I'm sorry, I can't help with that. I'm TripMate AI — ask me about trips, flights, hotels, or destinations!"
+    natural_response = state.get("final_response") or (
+        "I'm sorry, but I can't assist with that request. I'm TripMate AI, your dedicated "
+        "travel planning companion! Feel free to ask me about planning trips, discovering destinations, "
+        "finding flights, hotels, weather, or local activities."
     )
-    logger.info("[GUARDRAIL] Delivered blocked response to user.")
+    logger.info("[GUARDRAIL] Delivered natural blocked response to user.")
     return {
-        "final_response": reason,
-        "messages": [AIMessage(content=reason)],
+        "final_response": natural_response,
+        "messages": [AIMessage(content=natural_response)],
     }

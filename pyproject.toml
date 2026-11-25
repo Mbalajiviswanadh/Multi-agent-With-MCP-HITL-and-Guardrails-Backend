@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "airportsdata==20260315",
+    "deepeval>=2.5.5",
     "fastapi==0.136.3",
     "fastembed>=0.9.1",
     "huggingface>=0.0.1",
@@ -28,6 +29,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "python-dotenv==1.2.2",
     "requests==2.34.2",
+    "rich>=15.0.0",
     "tavily-python==0.7.24",
     "uvicorn==0.48.0",
 ]
