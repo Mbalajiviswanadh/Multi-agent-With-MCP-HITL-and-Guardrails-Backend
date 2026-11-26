@@ -205,7 +205,20 @@ def mem0_add(
 
         except Exception as exc:
             err_str = str(exc)
-            if attempt == 0 and ("413" in err_str or "429" in err_str or "rate_limit" in err_str):
+            # Single-request payload > 8000 TPM (e.g. user already has many memories):
+            # store directly via embeddings (infer=False) with 0 LLM tokens instead of failing.
+            if "413" in err_str or "Request too large" in err_str:
+                try:
+                    direct_kwargs = dict(kwargs)
+                    direct_kwargs["infer"] = False
+                    mem0.add(messages, **direct_kwargs)
+                    logger.info("[MEM0] Stored direct memory embedding (infer=False fallback) for user=%s", user_id)
+                    return True
+                except Exception as direct_exc:
+                    logger.error("[MEM0] Direct fallback failed for user=%s: %s", user_id, direct_exc)
+                    return False
+
+            if attempt == 0 and ("429" in err_str or "rate_limit" in err_str):
                 logger.warning("[MEM0] Rate limit hit for user=%s; retrying in 15s...", user_id)
                 time.sleep(15)
                 continue

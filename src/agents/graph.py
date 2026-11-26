@@ -39,10 +39,12 @@ from src.agents.specialists.flight import flight_agent
 from src.agents.specialists.hotel import hotel_agent
 from src.agents.specialists.weather import weather_agent
 from src.agents.specialists.budget import budget_agent
+from src.agents.specialists.user_mcp_agent import user_mcp_agent
 from src.agents.itinerary import itinerary_agent
 from src.agents.final import human_approval_agent, final_agent
 
 from src.core.logging_config import get_logger
+from src.mcp_dynamic.store import get_enabled_user_mcps
 from src.memory.checkpointer import get_checkpointer
 from src.memory.mem0_service import (
     mem0_search,
@@ -70,6 +72,7 @@ ROUTE_MAP = {
     "budget_agent":      "budget_agent",
     "itinerary_agent":   "itinerary_agent",
     "final_agent":       "final_agent",
+    "user_mcp_agent":    "user_mcp_agent",
 }
 
 
@@ -96,12 +99,21 @@ def route_after_agent(current_agent: str):
         selected = _selected_agents(state)
         current_index = AGENT_ORDER.index(current_agent)
         for next_agent in AGENT_ORDER[current_index + 1:]:
+            if next_agent == "user_mcp_agent":
+                continue  # Run user_mcp_agent AFTER final_agent finishes
             if next_agent in selected:
                 return next_agent
         if "itinerary_agent" in selected:
             return "itinerary_agent"
         return "final_agent"
     return route
+
+
+def route_after_final(state: TravelState) -> str:
+    """If user_mcp_agent was also selected (e.g. save trip to Google Drive), run it after final_agent."""
+    if "user_mcp_agent" in _selected_agents(state):
+        return "user_mcp_agent"
+    return END
 
 
 # =========================
@@ -122,6 +134,7 @@ def build_travel_graph():
     graph_builder.add_node("itinerary_agent",   itinerary_agent,        retry=LLM_RETRY_POLICY)
     graph_builder.add_node("human_approval",    human_approval_agent)
     graph_builder.add_node("final_agent",       final_agent,            retry=LLM_RETRY_POLICY)
+    graph_builder.add_node("user_mcp_agent",    user_mcp_agent,         retry=LLM_RETRY_POLICY)
 
     # ── Entry point & 3-way routing ─────────────────────────────────────────
     graph_builder.add_edge(START, "supervisor")
@@ -137,10 +150,15 @@ def build_travel_graph():
     graph_builder.add_conditional_edges("weather_agent", route_after_agent("weather_agent"), ROUTE_MAP)
     graph_builder.add_conditional_edges("budget_agent",  route_after_agent("budget_agent"),  ROUTE_MAP)
 
-    # Itinerary → HITL → Final → END
+    # Itinerary → HITL → Final → (optional user_mcp_agent) → END
     graph_builder.add_edge("itinerary_agent", "human_approval")
     graph_builder.add_edge("human_approval",  "final_agent")
-    graph_builder.add_edge("final_agent",     END)
+    graph_builder.add_conditional_edges(
+        "final_agent",
+        route_after_final,
+        {"user_mcp_agent": "user_mcp_agent", END: END},
+    )
+    graph_builder.add_edge("user_mcp_agent", END)
 
     checkpointer = get_checkpointer()
     return graph_builder.compile(checkpointer=checkpointer)
@@ -200,6 +218,8 @@ def serialize_result(result: dict[str, Any], thread_id: str) -> dict[str, Any]:
         "approved":             result.get("approved"),
         "human_feedback":       result.get("human_feedback", ""),
         "llm_calls":            result.get("llm_calls", 0),
+        "user_mcp_results":     result.get("user_mcp_results", ""),
+        "mcp_trace":            result.get("mcp_trace", {}),
     }
 
 
@@ -223,14 +243,16 @@ def _prepare_turn(
         travel_graph, config, thread_id
     )
 
-    # ── Tier 2 (Mem0) + Tier 3 (Vector): Load account profile & past trips in parallel ──
+    # ── Tier 2 (Mem0) + Tier 3 (Vector) + Connected MCPs: Load in parallel ──
     user_profile: dict[str, Any] = {}
     similar_trips: list[dict[str, Any]] = []
+    connected_mcps: list[dict[str, Any]] = []
     if user_id and user_id != "anonymous":
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             f_profile = executor.submit(load_user_profile, user_id)
             f_mem0 = executor.submit(mem0_get_user_context, user_input, user_id, 5)
             f_trips = executor.submit(find_similar_trips, user_id, user_input, 2)
+            f_mcps = executor.submit(get_enabled_user_mcps, user_id, False)
 
             try:
                 user_profile = f_profile.result() or {}
@@ -251,11 +273,19 @@ def _prepare_turn(
             except Exception as exc:
                 logger.warning("[VECTOR] Similar trips failed for user=%s: %s", user_id, exc)
 
+            try:
+                connected_mcps = f_mcps.result() or []
+            except Exception as exc:
+                logger.warning("[MCP_STORE] Failed to load connected MCPs for user=%s: %s", user_id, exc)
+
     state_input = cast(TravelState, initial_state(user_input, user_id=user_id, thread_id=thread_id))
     state_input["user_profile"]       = user_profile
     state_input["similar_past_trips"] = similar_trips
     state_input["trip_constraints"]   = existing_constraints
     state_input["context_summary"]    = existing_summary
+    state_input["connected_mcp_tools"] = connected_mcps
+    state_input["user_mcp_results"]   = ""
+    state_input["mcp_trace"]          = {}
 
     return thread_id, config, state_input, memory_trace
 

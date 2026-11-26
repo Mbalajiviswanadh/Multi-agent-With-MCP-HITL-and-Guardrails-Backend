@@ -63,6 +63,11 @@ class TravelState(TypedDict, total=False):
     final_response: str
     llm_calls: int
 
+    # ── Dynamic User MCP Integrations ─────────────────────────────────────
+    connected_mcp_tools: list[dict[str, Any]]
+    user_mcp_results: str
+    mcp_trace: dict[str, Any]
+
 
 def empty_constraints() -> dict[str, Any]:
     return {
@@ -103,4 +108,7 @@ def initial_state(user_query: str, user_id: str = "anonymous", thread_id: str = 
         "human_feedback": "",
         "final_response": "",
         "llm_calls": 0,
+        "connected_mcp_tools": [],
+        "user_mcp_results": "",
+        "mcp_trace": {},
     }

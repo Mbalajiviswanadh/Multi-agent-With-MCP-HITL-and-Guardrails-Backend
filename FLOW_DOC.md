@@ -822,3 +822,55 @@ ALL THREAD MEMORY & CONVERSATIONAL TESTS PASSED 100%!
 ```
 
 **Concept Covered:** Thread-Level State Checkpointing, Sliding Window Context, Coreference Resolution, Constraint Inheritance, Zero-LLM-Overhead Disambiguation, Rolling Summarization.
+
+---
+
+## ✅ Phase 17 — Dynamic User-Connected MCP Servers (Zero 3rd-Party Gateways)
+
+### Overview
+Users can now dynamically connect their own external MCP servers (Google Drive, Google Calendar, or any remote `streamable_http` / `sse` MCP URL via API Key or OAuth 2.1 + PKCE) directly from the UI without hardcoding anything in Python.
+
+### Architecture & File Structure
+
+```
+src/
+├── core/
+│   ├── config.py                    ← Added MCP_ENCRYPTION_KEY, GOOGLE_OAUTH_CLIENT_ID/SECRET, OAUTH_REDIRECT_BASE_URL
+│   └── encryption.py                ← Fernet (AES-128 + HMAC) encryption for stored user tokens/API keys
+├── mcp_dynamic/
+│   ├── __init__.py
+│   ├── catalog.py                   ← Curated MCP catalog (Google Drive, Calendar, Custom) + SSRF URL validator
+│   ├── store.py                     ← PostgreSQL `user_mcp_connections` table + CRUD (secrets stripped on read)
+│   ├── oauth.py                     ← Google OAuth2 + Standard MCP OAuth 2.1 (.well-known + RFC 7591 + PKCE) + auto-refresh
+│   └── client.py                    ← 1-time remote tool discovery + lazy per-request LangChain tool loader
+├── api/routers/
+│   └── mcp_servers.py               ← /api/mcp/catalog, /servers, /connect, /oauth/callback, PATCH, DELETE
+└── agents/specialists/
+    └── user_mcp_agent.py            ← Lazy ReAct tool-calling agent + structured `mcp_trace` for right-panel UI
+```
+
+### How It Works at Runtime (Zero-Overhead Optimization)
+1. **On Connect:** FastAPI validates the URL (blocking private/loopback SSRF IPs), performs a 1-time `get_tools()` handshake (or OAuth 2.1 PKCE popup), encrypts credentials with Fernet, and caches `cached_tools` in PostgreSQL (`user_mcp_connections`).
+2. **Normal Queries (`0ms` overhead):** `_prepare_turn()` reads `cached_tools` from PostgreSQL in parallel. If the user asks *"hotels in Goa"*, `user_mcp_agent` is never selected and no external MCP connections are opened.
+3. **External Action Queries:** When the user says *"Plan a 3-day trip to Goa and save it to Google Drive"* (or *"Save that plan to my Google Drive"*), Supervisor includes `user_mcp_agent`, which runs after `final_agent` (or standalone), decrypts & auto-refreshes OAuth tokens, executes the tool, and records `mcp_trace` for the right-side **Agent Flow** panel.
+
+### How Users Connect External MCPs
+
+#### 1. Google Drive / Google Calendar (One-Time Admin Setup in `.env`)
+1. In Google Cloud Console → **APIs & Services → Credentials**, create an **OAuth 2.0 Web Client**.
+2. Enable **Google Drive API**, **Google Docs API**, and **Google Calendar API**.
+3. Add Authorized Redirect URI: `http://localhost:8000/api/mcp/oauth/callback`.
+4. Add to `.env`:
+   ```env
+   GOOGLE_OAUTH_CLIENT_ID=your-client-id.apps.googleusercontent.com
+   GOOGLE_OAUTH_CLIENT_SECRET=your-client-secret
+   OAUTH_REDIRECT_BASE_URL=http://localhost:8000
+   ```
+5. In the app sidebar, click **MCP Integrations** → click **Connect** on **Google Drive** or **Google Calendar** → sign in via the popup.
+
+#### 2. Any Custom Remote MCP Server (URL + API Key or OAuth 2.1)
+1. Click **MCP Integrations** → **Add MCP Server** → scroll to **Custom Remote MCP**.
+2. Enter a display name, transport (`streamable_http` or `sse`), the HTTPS URL, and an optional API Key / Bearer Token (leave blank for open or OAuth 2.1 servers).
+3. Click **Connect & Discover Tools** — TripMate validates the URL, discovers its tools, and makes them available immediately.
+
+**Concept Covered:** Multi-Tenant Dynamic MCP Discovery, Fernet Secret Encryption, OAuth 2.1 + PKCE, SSRF Protection, Lazy Per-Request Tool Binding, UI Tool Execution Tracing.

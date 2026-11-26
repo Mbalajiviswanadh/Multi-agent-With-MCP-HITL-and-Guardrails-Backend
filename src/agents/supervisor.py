@@ -33,6 +33,7 @@ KNOWN_AGENTS = {
     "weather_agent",
     "budget_agent",
     "itinerary_agent",
+    "user_mcp_agent",
 }
 
 AGENT_ORDER = [
@@ -41,6 +42,7 @@ AGENT_ORDER = [
     "weather_agent",
     "budget_agent",
     "itinerary_agent",
+    "user_mcp_agent",
 ]
 
 
@@ -87,6 +89,26 @@ def supervisor_agent(state: TravelState) -> dict:
             "llm_calls": llm_calls,
         }
 
+    connected_mcps = state.get("connected_mcp_tools") or []
+
+    # If user has connected MCPs and asks to use one (e.g. "save to Google Drive",
+    # "add to Calendar"), don't let input_guardrail's "chat" bucket swallow it!
+    if intent == "chat" and connected_mcps:
+        q_lower = query.lower()
+        mcp_keywords = {"drive", "doc", "document", "docs", "calendar", "event", "file", "save", "export", "mcp"}
+        for srv in connected_mcps:
+            if srv.get("display_name"):
+                mcp_keywords.add(str(srv["display_name"]).lower())
+            if srv.get("server_slug"):
+                mcp_keywords.add(str(srv["server_slug"]).lower())
+            for t in (srv.get("cached_tools") or []):
+                for part in str(t.get("name", "")).lower().split("_"):
+                    if len(part) >= 3:
+                        mcp_keywords.add(part)
+        if any(kw in q_lower for kw in mcp_keywords if kw):
+            logger.info("[SUPERVISOR] Overriding 'chat' -> 'travel' (connected MCP action detected)")
+            intent = "travel"
+
     # ── CHAT ─────────────────────────────────────────────────────────────
     if intent == "chat":
         elapsed = time.time() - start_time
@@ -109,6 +131,29 @@ def supervisor_agent(state: TravelState) -> dict:
 
     recent_history_str = format_recent_history(state.get("messages", []))
 
+    if connected_mcps:
+        mcp_lines = []
+        for srv in connected_mcps:
+            tool_names = [t.get("name", "") for t in (srv.get("cached_tools") or []) if t.get("name")]
+            mcp_lines.append(
+                f"  - {srv.get('display_name', srv.get('server_slug'))}: tools={tool_names}"
+            )
+        connected_mcp_str = "\n".join(mcp_lines)
+        mcp_agent_line = (
+            "- user_mcp_agent: ONLY when the user explicitly asks to use one of their "
+            "connected external integrations (e.g., save/create doc in Google Drive, add event to "
+            "Google Calendar, check Drive/Calendar, or use a connected custom MCP tool).\n"
+        )
+        mcp_rule = (
+            "5. EXTERNAL MCP TOOLS: If the user asks to save/export/schedule/query using one of their "
+            "CONNECTED USER MCP INTEGRATIONS below, include \"user_mcp_agent\" in selected_agents. "
+            "NEVER select user_mcp_agent if the user did not ask to use an external integration.\n"
+        )
+    else:
+        connected_mcp_str = "None connected"
+        mcp_agent_line = ""
+        mcp_rule = ""
+
     supervisor_prompt = f"""\
 You are the supervisor of a multi-agent travel-planning system.
 Analyze the user request and choose ONLY the specialist agents that are strictly needed.
@@ -119,6 +164,9 @@ Available agents:
 - weather_agent: ONLY when user asks for weather, climate, season, forecast, or packing advice.
 - budget_agent: ONLY when user asks about budget feasibility, cost estimation, or price limits.
 - itinerary_agent: ONLY when user asks for a multi-day trip plan, day-by-day itinerary, schedule, tour, or full travel planning.
+{mcp_agent_line}
+CONNECTED USER MCP INTEGRATIONS:
+{connected_mcp_str}
 
 ACTIVE CONVERSATION CONTEXT:
 Summary: {context_summary or "None"}
@@ -136,6 +184,7 @@ CRITICAL ROUTING & DISAMBIGUATION RULES:
    - Output the resolved standalone query in "resolved_query".
 4. CONSTRAINT INHERITANCE:
    - Inherit active constraints (destination, origin, duration, budget, travel_style) unless the user explicitly changes or overrides them.
+{mcp_rule}
 
 Return strict JSON only using this schema:
 {{

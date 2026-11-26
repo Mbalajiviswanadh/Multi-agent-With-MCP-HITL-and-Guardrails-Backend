@@ -13,7 +13,9 @@ from fastapi.templating import Jinja2Templates
 from src.agents.graph import run_travel_agent, stream_travel_agent, travel_graph, resume_travel_agent
 from src.api.routers.threads import router as threads_router
 from src.api.routers.auth import router as auth_router
+from src.api.routers.mcp_servers import router as mcp_router
 from src.api.dependencies import get_current_user, get_optional_current_user
+from src.mcp_dynamic.store import run_mcp_schema_migrations
 from src.memory.profile_store import run_schema_migrations
 from src.memory.vector_store import run_vector_schema_migrations
 from src.memory.mem0_service import mem0_get_all, mem0_delete_user
@@ -51,6 +53,7 @@ async def lifespan(app: FastAPI):
     try:
         run_schema_migrations()
         run_vector_schema_migrations()
+        run_mcp_schema_migrations()
     except Exception as exc:
         print(f"[STARTUP] Notice: Database schema check: {exc}")
     yield
@@ -88,6 +91,7 @@ app.add_middleware(
 # Register Routers
 app.include_router(threads_router)
 app.include_router(auth_router)
+app.include_router(mcp_router)
 
 
 # =========================

@@ -67,3 +67,23 @@ def build_resilient_llm():
 
 # Module-level singleton — import this everywhere instead of constructing ChatGroq directly
 resilient_llm = build_resilient_llm()
+
+
+def bind_tools_resilient(tools: list):
+    """
+    Bind tools to BOTH primary (120B) and fallback (20B) BEFORE `.with_fallbacks()`
+    so 429/413 rate-limit fallback works reliably for tool-calling agents.
+    """
+    primary = ChatGroq(
+        model=_PRIMARY_MODEL,
+        api_key=settings.groq_api_key,
+        request_timeout=settings.groq_request_timeout,
+    ).bind_tools(tools)
+
+    fallback = ChatGroq(
+        model=_FALLBACK_MODEL,
+        api_key=settings.groq_api_key,
+        request_timeout=settings.groq_request_timeout,
+    ).bind_tools(tools)
+
+    return primary.with_fallbacks([fallback])

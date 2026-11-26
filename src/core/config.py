@@ -7,6 +7,7 @@ before the server binds to a port.
 """
 from __future__ import annotations
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +45,22 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "tripmate_production_jwt_secret_key_change_in_env_super_secure_99"
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 60 * 24 * 7  # 7 days expiration
+
+    # --- Dynamic User MCPs & OAuth ---
+    mcp_encryption_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("MCP_ENCRYPTION_KEY", "FERNET_SECRET_KEY"),
+    )
+    google_oauth_client_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_CLIENT_ID"),
+    )
+    google_oauth_client_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_CLIENT_SECRET"),
+    )
+    oauth_redirect_base_url: str = "http://localhost:8000"
+    frontend_url: str = "http://localhost:5173"
 
     # --- CORS ---
     allowed_origins: str = "http://localhost:3000,http://localhost:5173"
