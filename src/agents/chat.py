@@ -106,13 +106,32 @@ def chat_agent(state: TravelState) -> dict:
         )
 
     # ── 4. Store user facts at ACCOUNT level in background (non-blocking) ────
-    # Omit run_id so facts are shared across ALL threads for this user_id,
-    # and send only the user's message to keep Mem0 extraction well under TPM limits.
+    # Skip pure questions (e.g. "where am I from?") so we don't burn Groq's
+    # 8,000 TPM budget on turns that have no new facts to extract.
     if user_id and user_id != "anonymous":
-        mem0_add_async(
-            messages=[{"role": "user", "content": query}],
-            user_id=user_id,
+        q_stripped = query.strip()
+        q_lower = q_stripped.lower()
+        is_pure_question = (
+            q_stripped.endswith("?")
+            or q_lower.startswith(("what", "where", "who", "when", "how", "do you", "can you", "tell me", "hey do you"))
+        ) and not any(
+            kw in q_lower
+            for kw in ("i live", "i am from", "i'm from", "my name", "i prefer", "i like", "save ", "remember ")
         )
+
+        if not is_pure_question:
+            # Include previous user message only if current turn references "it"/"that"
+            needs_prev = any(w in q_lower for w in ("save it", "remember it", "that in your memory"))
+            if needs_prev and len(history_window) >= 2:
+                msgs_to_store = [
+                    {"role": "user", "content": str(m.content).strip()[:250]}
+                    for m in history_window[-3:]
+                    if isinstance(m, HumanMessage) and str(m.content).strip()
+                ]
+            else:
+                msgs_to_store = [{"role": "user", "content": q_stripped[:300]}]
+
+            mem0_add_async(messages=msgs_to_store, user_id=user_id)
 
     elapsed = time.time() - start_time
     logger.info("[CHAT_AGENT] OK Reply sent (%.1fs) | user=%s", elapsed, user_id)

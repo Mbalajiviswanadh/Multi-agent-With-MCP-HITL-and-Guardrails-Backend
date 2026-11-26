@@ -419,18 +419,19 @@ def resume_travel_agent(
             constraints = result.get("trip_constraints", {})
             memory_messages: list[dict] = []
 
-            # Build a summary of what was planned for memory extraction
+            # Build a clean summary of non-empty trip details (skip N/A/empty fields
+            # so Mem0 doesn't store "User has no specified preferences" noise)
             if constraints.get("destination"):
-                memory_messages.append({
-                    "role": "user",
-                    "content": (
-                        f"I just planned a trip to {constraints.get('destination')} "
-                        f"({constraints.get('duration', 'N/A')}). "
-                        f"Budget: {constraints.get('budget', 'N/A')}. "
-                        f"Style: {constraints.get('travel_style', 'N/A')}. "
-                        f"Preferences: {constraints.get('special_preferences', [])}."
-                    ),
-                })
+                parts = [f"I just planned a trip to {constraints['destination']}"]
+                if constraints.get("duration"):
+                    parts.append(f"Duration: {constraints['duration']}")
+                if constraints.get("budget"):
+                    parts.append(f"Budget: {constraints['budget']}")
+                if constraints.get("travel_style"):
+                    parts.append(f"Style: {constraints['travel_style']}")
+                if constraints.get("special_preferences"):
+                    parts.append(f"Preferences: {constraints['special_preferences']}")
+                memory_messages.append({"role": "user", "content": ". ".join(parts) + "."})
             if feedback:
                 memory_messages.append({
                     "role": "user",
@@ -441,7 +442,8 @@ def resume_travel_agent(
                 mem0_add(memory_messages, user_id=user_id, run_id=thread_id)
 
         # ── Tier 3: Store finalized itinerary in pgvector ───────────────────
-        if serialized.get("final_response") and user_id and user_id != "anonymous":
+        final_text = serialized.get("answer") or result.get("final_response", "")
+        if final_text and not serialized.get("requires_approval") and user_id and user_id != "anonymous":
             destination = (
                 result.get("trip_constraints", {}).get("destination")
                 or "Unknown Destination"
@@ -450,7 +452,7 @@ def resume_travel_agent(
                 user_id=user_id,
                 thread_id=thread_id,
                 destination=destination,
-                final_itinerary=serialized["final_response"],
+                final_itinerary=final_text,
             )
 
         logger.info("-" * 60)

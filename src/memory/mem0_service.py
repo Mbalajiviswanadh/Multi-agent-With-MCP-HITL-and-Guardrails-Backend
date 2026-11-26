@@ -69,10 +69,10 @@ def _build_mem0_config() -> dict:
         "llm": {
             "provider": "groq",
             "config": {
-                "model": "openai/gpt-oss-20b",      # Fast, high TPM model available on your Groq key
+                "model": "openai/gpt-oss-20b",      # Available on Groq key; 600 tokens balances JSON + 8k TPM limit
                 "api_key": settings.groq_api_key,
-                "temperature": 0.1,                  # Low temp for factual extraction
-                "max_tokens": 256,                   # Keep under Groq 8k TPM reservation limit
+                "temperature": 0.1,
+                "max_tokens": 600,
             },
         },
         "embedder": {
@@ -113,6 +113,23 @@ def _get_mem0():
 
         config = _build_mem0_config()
         _mem0_instance = Memory.from_config(config)
+
+        # Ensure Qdrant Cloud has keyword payload indexes on user_id & agent_id
+        # for fast, O(1)-filtered vector search at scale.
+        try:
+            q_client = getattr(_mem0_instance.vector_store, "client", None)
+            if q_client is not None:
+                from qdrant_client.models import PayloadSchemaType
+                for field in ("user_id", "agent_id"):
+                    q_client.create_payload_index(
+                        collection_name="tripmate_memories",
+                        field_name=field,
+                        field_schema=PayloadSchemaType.KEYWORD,
+                    )
+                logger.info("[MEM0] Qdrant keyword payload indexes verified (user_id, agent_id)")
+        except Exception as idx_exc:
+            logger.debug("[MEM0] Payload index check note: %s", idx_exc)
+
         dest = settings.qdrant_url if settings.qdrant_url else _QDRANT_LOCAL_PATH
         logger.info(
             "[MEM0] Initialized | LLM: Groq/openai/gpt-oss-20b | "
@@ -168,24 +185,34 @@ def mem0_add(
     if run_id:
         kwargs["run_id"] = run_id
 
-    try:
-        result = mem0.add(messages, **kwargs)
-        # Mem0 returns a dict with "results" list of added/updated memories
-        added = result.get("results", []) if isinstance(result, dict) else []
-        if added:
-            logger.info(
-                "[MEM0] Stored %d memory fact(s) for user=%s",
-                len(added), user_id,
-            )
-            for m in added:
-                action = m.get("event", "ADD")
-                content = m.get("memory", "")[:80]
-                logger.debug("[MEM0]   [%s] %s", action, content)
-        return True
+    import time
 
-    except Exception as exc:
-        logger.error("[MEM0] Failed to add memories for user=%s: %s", user_id, exc)
-        return False
+    for attempt in range(2):
+        try:
+            result = mem0.add(messages, **kwargs)
+            # Mem0 returns a dict with "results" list of added/updated memories
+            added = result.get("results", []) if isinstance(result, dict) else []
+            if added:
+                logger.info(
+                    "[MEM0] Stored %d memory fact(s) for user=%s",
+                    len(added), user_id,
+                )
+                for m in added:
+                    action = m.get("event", "ADD")
+                    content = m.get("memory", "")[:80]
+                    logger.debug("[MEM0]   [%s] %s", action, content)
+            return True
+
+        except Exception as exc:
+            err_str = str(exc)
+            if attempt == 0 and ("413" in err_str or "429" in err_str or "rate_limit" in err_str):
+                logger.warning("[MEM0] Rate limit hit for user=%s; retrying in 15s...", user_id)
+                time.sleep(15)
+                continue
+            logger.error("[MEM0] Failed to add memories for user=%s: %s", user_id, exc)
+            return False
+
+    return False
 
 
 def mem0_add_async(
@@ -211,17 +238,32 @@ def mem0_get_user_context(
     top_k: int = 5,
 ) -> list[dict[str, Any]]:
     """
-    Fast account-level memory retrieval:
+    Production-grade account-level memory retrieval:
       1. Runs semantic search for `query` scoped to `user_id` + `agent_id`.
-      2. If semantic search returns nothing (e.g. short/typo/general query like
-         'hi' or 'do you know myname?'), falls back to mem0_get_all(user_id)
-         so core account facts (name, preferences) are always available.
+      2. Keeps high-confidence semantic matches (score >= 0.25).
+      3. Supplements up to `top_k` from `mem0_get_all(user_id)` so core user facts
+         (e.g. "lives in Guntur" when asked "what is my native place?") are never
+         crowded out by low-similarity trip summaries.
     """
-    memories = mem0_search(query, user_id=user_id, top_k=top_k)
-    if memories:
-        return memories
+    raw_hits = mem0_search(query, user_id=user_id, top_k=top_k)
+    strong_hits = [m for m in raw_hits if float(m.get("score", 0.0)) >= 0.25]
+
+    if len(strong_hits) >= top_k:
+        return strong_hits[:top_k]
+
     all_memories = mem0_get_all(user_id)
-    return all_memories[:top_k] if all_memories else []
+    if not all_memories:
+        return strong_hits or raw_hits[:top_k]
+
+    seen_ids = {m.get("id") for m in strong_hits if m.get("id")}
+    combined = list(strong_hits)
+    for m in all_memories:
+        if m.get("id") not in seen_ids:
+            combined.append(m)
+            seen_ids.add(m.get("id"))
+        if len(combined) >= top_k:
+            break
+    return combined
 
 
 def mem0_search(
