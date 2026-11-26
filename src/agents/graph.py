@@ -21,11 +21,12 @@ from __future__ import annotations
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, cast
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
 from src.agents.state import TravelState, empty_constraints, initial_state
 from src.agents.supervisor import (
@@ -50,7 +51,9 @@ from src.memory.mem0_service import (
     mem0_format_for_context,
 )
 from src.memory.profile_store import load_user_profile
+from src.memory.thread_memory import finalize_memory_trace, load_thread_memory
 from src.memory.vector_store import store_trip_embedding, find_similar_trips
+from src.reliability.llm_factory import resilient_llm
 from src.reliability.retry_policy import MCP_RETRY_POLICY, LLM_RETRY_POLICY
 
 logger = get_logger("TripMateAI.agents.graph")
@@ -204,83 +207,25 @@ def serialize_result(result: dict[str, Any], thread_id: str) -> dict[str, Any]:
 # Execution Runners
 # =========================
 
-def _generate_rolling_summary(older_messages: list, current_summary: str) -> str:
-    """Summarize older messages into 2-3 concise bullet points to keep context small."""
-    from langchain_core.messages import SystemMessage, HumanMessage
-    convo_text = []
-    for m in older_messages:
-        role = "User" if isinstance(m, HumanMessage) else "Assistant"
-        snippet = str(m.content).strip()
-        if len(snippet) > 250:
-            snippet = snippet[:250] + "..."
-        convo_text.append(f"{role}: {snippet}")
-    text_block = "\n".join(convo_text)
-    prompt = f"""Summarize the key facts, destination, hotel choices, constraints, and decisions made in this previous conversation into 2-3 concise bullet points.
-Previous summary: {current_summary or 'None'}
-
-Conversation:
-{text_block}
-
-Return only the updated 2-3 bullet points."""
-    try:
-        res = resilient_llm.invoke([
-            SystemMessage(content="You are a concise conversation summarizer."),
-            HumanMessage(content=prompt)
-        ])
-        return str(res.content).strip()
-    except Exception as exc:
-        logger.warning("[SUMMARY] Rolling summary failed: %s", exc)
-        return current_summary
-
-
-def run_travel_agent(
+def _prepare_turn(
     user_input: str,
     thread_id: str | None = None,
     user_id: str = "anonymous",
-) -> dict[str, Any]:
-    """Start a new conversation turn with 3-tier memory + Mem0 support."""
+) -> tuple[str, RunnableConfig, TravelState, dict[str, Any]]:
+    """Shared turn setup for both sync and streaming execution."""
     if not thread_id:
         thread_id = f"user_{uuid.uuid4().hex}"
 
-    logger.info("=" * 60)
-    logger.info("[START] Turn | Thread: %s | User: %s", thread_id, user_id)
-    logger.info("[QUERY] \"%s\"", user_input)
-    logger.info("-" * 60)
-    start_time = time.time()
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-    config = {"configurable": {"thread_id": thread_id}}
+    # ── Tier 1 + 2 + 4: Load thread memory strategies from unified module ──
+    existing_constraints, existing_summary, memory_trace = load_thread_memory(
+        travel_graph, config, thread_id
+    )
 
-    # ── Tier 1: Check existing thread state from checkpoint ──
-    existing_constraints = empty_constraints()
-    existing_summary = ""
-    thread_msg_count = 0
-    rolling_summary_triggered = False
-    sliding_window_size = 0
-    constraint_keys_inherited: list[str] = []
-
-    try:
-        checkpoint_state = travel_graph.get_state(config)
-        if checkpoint_state and checkpoint_state.values:
-            existing_constraints = checkpoint_state.values.get("trip_constraints") or empty_constraints()
-            existing_summary = checkpoint_state.values.get("context_summary") or ""
-            existing_messages = checkpoint_state.values.get("messages") or []
-            thread_msg_count = len(existing_messages)
-            sliding_window_size = min(6, thread_msg_count)
-            constraint_keys_inherited = [k for k, v in existing_constraints.items() if v and k != "special_preferences"]
-
-            # Rolling summary if conversation exceeds 10 messages (keeps context window small)
-            if thread_msg_count >= 10:
-                rolling_summary_triggered = True
-                logger.info("[SUMMARY] Thread %s has %d messages. Generating rolling summary...", thread_id, thread_msg_count)
-                existing_summary = _generate_rolling_summary(existing_messages[:-4], existing_summary)
-    except Exception as cp_exc:
-        logger.warning("[CHECKPOINT] Could not read prior thread state: %s", cp_exc)
-
-    # ── Tier 2 + Tier 3: Load account profile, Mem0 memories & past trips in parallel ──
+    # ── Tier 2 (Mem0) + Tier 3 (Vector): Load account profile & past trips in parallel ──
     user_profile: dict[str, Any] = {}
     similar_trips: list[dict[str, Any]] = []
-    mem0_hits: int = 0
-    vector_hits: int = 0
     if user_id and user_id != "anonymous":
         with ThreadPoolExecutor(max_workers=3) as executor:
             f_profile = executor.submit(load_user_profile, user_id)
@@ -294,7 +239,7 @@ def run_travel_agent(
 
             try:
                 memories = f_mem0.result() or []
-                mem0_hits = len(memories)
+                memory_trace["mem0_hits"] = len(memories)
                 if memories:
                     user_profile["mem0_context"] = mem0_format_for_context(memories)
             except Exception as exc:
@@ -302,73 +247,37 @@ def run_travel_agent(
 
             try:
                 similar_trips = f_trips.result() or []
-                vector_hits = len(similar_trips)
+                memory_trace["vector_hits"] = len(similar_trips)
             except Exception as exc:
                 logger.warning("[VECTOR] Similar trips failed for user=%s: %s", user_id, exc)
 
-    state_input = initial_state(user_input, user_id=user_id, thread_id=thread_id)
+    state_input = cast(TravelState, initial_state(user_input, user_id=user_id, thread_id=thread_id))
     state_input["user_profile"]       = user_profile
     state_input["similar_past_trips"] = similar_trips
-    state_input["trip_constraints"]   = existing_constraints  # Inherit active constraints
-    state_input["context_summary"]    = existing_summary      # Preserve/update running summary
+    state_input["trip_constraints"]   = existing_constraints
+    state_input["context_summary"]    = existing_summary
 
-    # ── LLM call accounting per memory tier ──────────────────────────────────
-    # Tier 1 (Sliding Window):       0 LLM calls — pure state slice
-    # Tier 2 (Rolling Summary):      1 LLM call when triggered (thread >= 10 msgs)
-    # Tier 3 (Supervisor/Rewriter):  1 LLM call always (the main supervisor call)
-    #                                (rewriting is piggybacked — 0 EXTRA calls)
-    # Tier 4 (Constraint Inherit):   0 LLM calls — pure state lookup
-    # Mem0 search:                   uses embeddings internally (no generation call)
-    tier_llm_calls = {
-        "sliding_window":     0,                           # zero — pure state slice
-        "rolling_summary":    1 if rolling_summary_triggered else 0,
-        "supervisor_rewriter": 1,                          # always 1 — main supervisor call
-        "constraint_inherit": 0,                           # zero — state lookup
-    }
-    total_memory_llm_calls = sum(tier_llm_calls.values())
+    return thread_id, config, state_input, memory_trace
 
-    # Store memory trace metadata on state_input for serialization
-    state_input["_memory_trace"] = {
-        "thread_msg_count":          thread_msg_count,
-        "sliding_window_size":       sliding_window_size,
-        "rolling_summary_triggered": rolling_summary_triggered,
-        "rolling_summary_preview":   existing_summary[:200] if existing_summary else "",
-        "constraint_keys_inherited": constraint_keys_inherited,
-        "mem0_hits":                 mem0_hits,
-        "vector_hits":               vector_hits,
-        "has_prior_constraints":     bool(constraint_keys_inherited),
-        "tier_llm_calls":            tier_llm_calls,
-        "total_memory_llm_calls":    total_memory_llm_calls,
-    }
 
-    _memory_trace = state_input.pop("_memory_trace", {})
+def run_travel_agent(
+    user_input: str,
+    thread_id: str | None = None,
+    user_id: str = "anonymous",
+) -> dict[str, Any]:
+    """Start a new conversation turn with 3-tier memory + Mem0 support."""
+    logger.info("=" * 60)
+    logger.info("[START] Turn | Thread: %s | User: %s", thread_id or "(new)", user_id)
+    logger.info("[QUERY] \"%s\"", user_input)
+    logger.info("-" * 60)
+    start_time = time.time()
+
+    thread_id, config, state_input, _memory_trace = _prepare_turn(user_input, thread_id, user_id)
 
     try:
         result = travel_graph.invoke(state_input, config=config)
         elapsed = time.time() - start_time
-        serialized = serialize_result(result, thread_id)
-
-        # Enrich serialized response with memory trace so the UI can visualize it
-        query_intent = serialized.get("query_intent", "travel")
-        resolved = serialized.get("resolved_query", user_input)
-        query_was_rewritten = resolved and resolved.strip().lower() != user_input.strip().lower()
-        _memory_trace["query_was_rewritten"] = query_was_rewritten
-        _memory_trace["resolved_query"] = resolved
-        _memory_trace["original_query"] = user_input
-        _memory_trace["strategy_chosen"] = (
-            "chat_recall"       if query_intent == "chat" else
-            "constraint_reuse"  if _memory_trace.get("has_prior_constraints") and not query_was_rewritten else
-            "coreference"       if query_was_rewritten else
-            "fresh"
-        )
-
-        # If query was rewritten by supervisor, mark the supervisor call as doing double duty
-        if query_was_rewritten:
-            _memory_trace["tier_llm_calls"]["supervisor_rewriter_note"] = (
-                "1 call — rewriting + routing combined (0 extra)"
-            )
-
-        serialized["memory_trace"] = _memory_trace
+        serialized = finalize_memory_trace(_memory_trace, serialize_result(result, thread_id), user_input)
 
         logger.info("-" * 60)
         intent = serialized.get("query_intent", "travel")
@@ -385,6 +294,96 @@ def run_travel_agent(
         logger.error("[FAILED] Thread %s after %.1fs: %s", thread_id, elapsed, exc)
         logger.info("=" * 60)
         raise
+
+
+def stream_travel_agent(
+    user_input: str,
+    thread_id: str | None = None,
+    user_id: str = "anonymous",
+):
+    """Yield SSE event tuples (event_name, data_dict) for live streaming."""
+    logger.info("=" * 60)
+    logger.info("[STREAM START] Turn | Thread: %s | User: %s", thread_id or "(new)", user_id)
+    logger.info("[QUERY] \"%s\"", user_input)
+    logger.info("-" * 60)
+    start_time = time.time()
+
+    thread_id, config, state_input, _memory_trace = _prepare_turn(user_input, thread_id, user_id)
+    selected_agents: list[str] = []
+    streamed_nodes = {"chat_agent", "final_agent", "itinerary_agent", "guardrail_blocked"}
+
+    yield ("agent_started", {"agent": "supervisor"})
+
+    try:
+        for stream_mode, chunk in travel_graph.stream(
+            state_input,
+            config=config,
+            stream_mode=["updates", "messages"],
+        ):
+            if stream_mode == "updates" and isinstance(chunk, dict):
+                for node, update in chunk.items():
+                    if node == "__interrupt__" or not isinstance(update, dict):
+                        continue
+                    yield ("agent_done", {"agent": node})
+                    if node == "supervisor":
+                        allowed = update.get("guardrail_allowed", True)
+                        intent = update.get("query_intent", "travel")
+                        selected_agents = update.get("selected_agents", [])
+                        yield ("supervisor_plan", {
+                            "allowed": allowed,
+                            "intent": intent,
+                            "selected_agents": selected_agents,
+                            "reasoning": update.get("supervisor_reasoning", ""),
+                        })
+                        if not allowed:
+                            yield ("agent_started", {"agent": "guardrail_blocked"})
+                        elif intent == "chat":
+                            yield ("agent_started", {"agent": "chat_agent"})
+                        elif selected_agents:
+                            yield ("agent_started", {"agent": selected_agents[0]})
+                    elif node == "itinerary_agent":
+                        yield ("agent_started", {"agent": "human_approval"})
+                    elif node == "human_approval":
+                        yield ("agent_started", {"agent": "final_agent"})
+                    elif selected_agents and node in selected_agents:
+                        curr_idx = selected_agents.index(node)
+                        if curr_idx + 1 < len(selected_agents):
+                            yield ("agent_started", {"agent": selected_agents[curr_idx + 1]})
+                        else:
+                            yield ("agent_started", {"agent": "final_agent"})
+
+            elif stream_mode == "messages" and isinstance(chunk, tuple) and len(chunk) == 2:
+                msg_chunk, metadata = chunk
+                node_name = metadata.get("langgraph_node", "") if isinstance(metadata, dict) else ""
+                if (
+                    node_name in streamed_nodes
+                    and isinstance(msg_chunk, AIMessageChunk)
+                    and msg_chunk.content
+                ):
+                    yield ("token", {"text": msg_chunk.content, "node": node_name})
+
+        # Read final persisted state snapshot (handles both normal completion & HITL __interrupt__)
+        snapshot = travel_graph.get_state(config)
+        final_values = dict(getattr(snapshot, "values", {}) or {})
+        if getattr(snapshot, "tasks", None):
+            interrupts = []
+            for task in snapshot.tasks:
+                for intr in getattr(task, "interrupts", ()) or ():
+                    interrupts.append(intr)
+            if interrupts:
+                final_values["__interrupt__"] = interrupts
+
+        serialized = finalize_memory_trace(_memory_trace, serialize_result(final_values, thread_id), user_input)
+        elapsed = time.time() - start_time
+        logger.info("[STREAM FINISHED] (%.1fs) | Thread: %s", elapsed, thread_id)
+        logger.info("=" * 60)
+        yield ("result", serialized)
+
+    except Exception as exc:
+        elapsed = time.time() - start_time
+        logger.error("[STREAM FAILED] Thread %s after %.1fs: %s", thread_id, elapsed, exc)
+        logger.info("=" * 60)
+        yield ("error", {"message": str(exc)})
 
 
 def resume_travel_agent(

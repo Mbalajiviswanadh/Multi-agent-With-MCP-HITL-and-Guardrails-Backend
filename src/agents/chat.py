@@ -28,6 +28,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from src.agents.state import TravelState
 from src.core.logging_config import get_logger
 from src.memory.mem0_service import mem0_add_async, mem0_get_user_context, mem0_format_for_context
+from src.memory.thread_memory import get_sliding_window
 from src.reliability.llm_factory import resilient_llm
 
 logger = get_logger("TripMateAI.agents.chat")
@@ -87,17 +88,7 @@ def chat_agent(state: TravelState) -> dict:
         system_content += f"\n\nKnown User Context:\n{memory_context}"
 
     # ── 3. Generate conversational reply (using sliding window of thread messages) ──
-    # LangGraph state['messages'] contains the conversation history for this thread.
-    # Take the last 6 messages to keep context focused, bounded, and fast (0 extra LLM calls).
-    all_messages = state.get("messages", [])
-    if all_messages:
-        # Window of recent conversation history (last 6 messages)
-        history_window = all_messages[-6:]
-        # Ensure the current query is at the end if not already present
-        if not history_window or history_window[-1].content != query:
-            history_window = list(history_window) + [HumanMessage(content=query)]
-    else:
-        history_window = [HumanMessage(content=query)]
+    history_window = get_sliding_window(state.get("messages", []), query)
 
     try:
         response = resilient_llm.invoke(

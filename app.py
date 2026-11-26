@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from src.agents.graph import run_travel_agent, travel_graph, resume_travel_agent
+from src.agents.graph import run_travel_agent, stream_travel_agent, travel_graph, resume_travel_agent
 from src.api.routers.threads import router as threads_router
 from src.api.routers.auth import router as auth_router
 from src.api.dependencies import get_current_user, get_optional_current_user
@@ -432,113 +432,27 @@ def _sse(event: str, data: dict) -> str:
 
 
 @app.post("/api/travel/stream")
-def travel_stream(request_data: TravelRequest):
+def travel_stream(
+    request_data: TravelRequest,
+    current_user: dict | None = Depends(get_optional_current_user),
+):
     message = request_data.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    thread_id = request_data.thread_id or f"user_{uuid.uuid4().hex}"
-    config = {"configurable": {"thread_id": thread_id}}
+    effective_user_id = (
+        str(current_user["id"]) if current_user
+        else (request_data.user_id or "anonymous")
+    )
 
     def events():
         try:
-            merged = {
-                "flight_results": "",
-                "hotel_results": "",
-                "weather_results": "",
-                "budget_results": "",
-                "itinerary": "",
-                "llm_calls": 0,
-            }
-            answer = ""
-            selected_agents = []
-
-            # Emit initial supervisor start event
-            yield _sse("agent_started", {"agent": "supervisor"})
-
-            for stream_mode, chunk in travel_graph.stream(
-                {
-                    "messages": [HumanMessage(content=message)],
-                    "user_query": message,
-                    "guardrail_allowed": True,
-                    "guardrail_reason": "",
-                    "selected_agents": [],
-                    "trip_constraints": {},
-                    "supervisor_reasoning": "",
-                    "flight_results": "",
-                    "hotel_results": "",
-                    "weather_results": "",
-                    "budget_results": "",
-                    "itinerary": "",
-                    "approval_request": "",
-                    "approved": False,
-                    "human_feedback": "",
-                    "final_response": "",
-                    "llm_calls": 0,
-                },
-                config=config,
-                stream_mode=["updates", "messages"],
+            for event_name, payload in stream_travel_agent(
+                user_input=message,
+                thread_id=request_data.thread_id,
+                user_id=effective_user_id,
             ):
-                # ── Node-completion events ──
-                if stream_mode == "updates":
-                    for node, update in chunk.items():
-                        # Supervisor finished
-                        if node == "supervisor":
-                            allowed = update.get("guardrail_allowed", True)
-                            selected_agents = update.get("selected_agents", [])
-                            yield _sse("agent_done", {"agent": "supervisor"})
-                            yield _sse("supervisor_plan", {
-                                "allowed": allowed,
-                                "selected_agents": selected_agents,
-                                "reasoning": update.get("supervisor_reasoning", ""),
-                            })
-                            if not allowed:
-                                answer = update.get("final_response", "")
-                                continue
-                            if selected_agents:
-                                yield _sse("agent_started", {"agent": selected_agents[0]})
-                            continue
-
-                        # Guardrail blocked response
-                        if node == "guardrail_blocked":
-                            answer = update.get("final_response", "")
-                            yield _sse("agent_done", {"agent": "guardrail_blocked"})
-                            continue
-
-                        # Specialist & planning updates
-                        for key in ("flight_results", "hotel_results", "weather_results", "budget_results", "itinerary"):
-                            if key in update:
-                                merged[key] = update[key]
-
-                        yield _sse("agent_done", {"agent": node})
-
-                        if node == "final_agent":
-                            answer = update.get("final_response") or (
-                                update.get("messages", [])[-1].content if update.get("messages") else ""
-                            )
-                        elif node == "itinerary_agent":
-                            yield _sse("agent_started", {"agent": "human_approval"})
-                        elif node == "human_approval":
-                            yield _sse("agent_started", {"agent": "final_agent"})
-                        elif selected_agents and node in selected_agents:
-                            curr_idx = selected_agents.index(node)
-                            if curr_idx + 1 < len(selected_agents):
-                                yield _sse("agent_started", {"agent": selected_agents[curr_idx + 1]})
-
-                # ── Token-level streaming from final LLM ──
-                elif stream_mode == "messages":
-                    msg_chunk, metadata = chunk
-                    node_name = metadata.get("langgraph_node", "")
-                    if node_name == "final_agent" and hasattr(msg_chunk, "content") and msg_chunk.content:
-                        yield _sse("token", {"text": msg_chunk.content})
-
-            yield _sse("result", {
-                "thread_id": thread_id,
-                "answer": answer,
-                "selected_agents": selected_agents,
-                **merged,
-            })
-
+                yield _sse(event_name, payload)
         except Exception as exc:
             traceback.print_exc()
             yield _sse("error", {"message": f"Error during streaming: {str(exc)}"})

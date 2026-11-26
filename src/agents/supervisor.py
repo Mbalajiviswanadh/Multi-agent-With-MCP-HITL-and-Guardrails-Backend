@@ -21,6 +21,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.agents.state import TravelState, empty_constraints
 from src.core.logging_config import get_logger
+from src.memory.thread_memory import format_recent_history, merge_constraints
 from src.guardrails.input_guardrail import check_input
 from src.reliability.llm_factory import resilient_llm
 
@@ -106,29 +107,7 @@ def supervisor_agent(state: TravelState) -> dict:
     existing_constraints = state.get("trip_constraints") or empty_constraints()
     context_summary = state.get("context_summary", "")
 
-    _INTERNAL_HANDOFFS = {
-        "Routing to travel specialists.",
-        "Routing to chat agent.",
-        "Flight information processed.",
-        "Hotel information processed.",
-        "Weather information processed.",
-        "Weather information requires a destination.",
-        "Budget analysis processed.",
-        "Draft itinerary created.",
-    }
-    all_messages = state.get("messages", [])
-    real_messages = [
-        m for m in all_messages[:-1]
-        if not (isinstance(m, AIMessage) and str(m.content).strip() in _INTERNAL_HANDOFFS)
-    ]
-    history_lines = []
-    for msg in real_messages[-6:]:
-        role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-        snippet = str(msg.content).strip()
-        if len(snippet) > 180:
-            snippet = snippet[:180] + "..."
-        history_lines.append(f"{role}: {snippet}")
-    recent_history_str = "\n".join(history_lines) if history_lines else "None (first turn)"
+    recent_history_str = format_recent_history(state.get("messages", []))
 
     supervisor_prompt = f"""\
 You are the supervisor of a multi-agent travel-planning system.
@@ -205,14 +184,7 @@ User request:
             else:
                 selected_agents = ["itinerary_agent"]
 
-        constraints = empty_constraints()
-        if existing_constraints:
-            constraints.update(existing_constraints)
-        parsed_constraints = parsed.get("trip_constraints", {})
-        if isinstance(parsed_constraints, dict):
-            for k, v in parsed_constraints.items():
-                if v:
-                    constraints[k] = v
+        constraints = merge_constraints(existing_constraints, parsed.get("trip_constraints"))
 
         resolved_query = str(parsed.get("resolved_query") or query).strip()
         reasoning = str(parsed.get("reasoning", "")).strip()
