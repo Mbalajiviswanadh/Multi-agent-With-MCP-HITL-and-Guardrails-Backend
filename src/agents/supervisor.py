@@ -59,13 +59,23 @@ def supervisor_agent(state: TravelState) -> dict:
     query = state["user_query"]
     llm_calls = state.get("llm_calls", 0)
 
-    logger.info("[SUPERVISOR] -> Classifying request with guardrail...")
+    connected_mcps = state.get("connected_mcp_tools") or []
 
-    # 1. Run Intent Classifier (chat / travel / blocked)
-    guardrail_result = check_input(query, resilient_llm)
+    logger.info("[SUPERVISOR] -> Classifying request with unified router...")
+
+    # 1. Run Unified Intent & MCP Server Router (chat / travel / mcp / blocked)
+    guardrail_result = check_input(
+        query,
+        resilient_llm,
+        connected_mcps=connected_mcps,
+        recent_messages=state.get("messages"),
+    )
     intent = guardrail_result.get("intent", "chat")
     allowed = guardrail_result["allowed"]
     guardrail_reason = guardrail_result.get("reason", "")
+    target_servers = guardrail_result.get("target_servers") or []
+    resolved_mcp_query = guardrail_result.get("resolved_query") or query
+    needs_past_trips = bool(guardrail_result.get("needs_past_trips", False))
     llm_calls += 1
 
     # ── BLOCKED ─────────────────────────────────────────────────────────
@@ -90,62 +100,25 @@ def supervisor_agent(state: TravelState) -> dict:
             "llm_calls": llm_calls,
         }
 
-    connected_mcps = state.get("connected_mcp_tools") or []
-
-    def _is_explicit_mcp_request(q: str) -> bool:
-        """True ONLY when the user explicitly mentions a connected integration or file/calendar action."""
-        ql = q.lower()
-        # 1. Explicit connected server names/slugs (e.g. 'notion', 'google drive', 'calendar')
-        for srv in connected_mcps:
-            disp = str(srv.get("display_name", "")).lower().strip()
-            slug = str(srv.get("server_slug", "")).lower().strip()
-            if disp and re.search(rf"\b{re.escape(disp)}\b", ql):
-                return True
-            for tok in re.split(r"[\s_-]+", f"{disp} {slug}"):
-                if len(tok) >= 4 and tok not in ("google", "custom", "remote", "server"):
-                    if re.search(rf"\b{re.escape(tok)}\b", ql):
-                        return True
-
-        # 2. Explicit external artifact phrases
-        explicit_phrases = (
-            r"\bgoogle\s+docs?\b", r"\bgoogle\s+sheets?\b", r"\bgoogle\s+drive\b",
-            r"\bgoogle\s+calendar\b", r"\bspreadsheets?\b", r"\bexcel\b", r"\bmcp\b",
+    # ── PURE MCP ACTION (1 LLM call saved — skips travel Supervisor) ─────
+    if intent == "mcp":
+        elapsed = time.time() - start_time
+        logger.info(
+            "[SUPERVISOR] OK MCP intent (%.1fs) | Servers: %s | Query: '%s'",
+            elapsed, target_servers or ["auto"], resolved_mcp_query,
         )
-        if any(re.search(p, ql) for p in explicit_phrases):
-            return True
-
-        # 3. Action verb + external file/doc/sheet/calendar noun together (never bare verbs like 'check'/'create')
-        has_action = bool(re.search(r"\b(create|make|save|export|add|write|put|update|append|delete|remove|read|list|check|open|show)\b", ql))
-        has_artifact = bool(re.search(r"\b(doc|docs|document|documents|sheet|sheets|file|files|calendar)\b", ql))
-        return has_action and has_artifact
-
-    is_mcp_req = bool(connected_mcps) and _is_explicit_mcp_request(query)
-
-    if is_mcp_req:
-        if intent == "chat":
-            logger.info("[SUPERVISOR] Overriding 'chat' -> 'travel' (explicit MCP action detected)")
-            intent = "travel"
-
-        # Only short-circuit straight to user_mcp_agent when the user is NOT also asking
-        # to plan a new trip or search flights/hotels/weather in the same message.
-        also_planning_trip = bool(re.search(
-            r"\b(plan\s+(a|my|the)\s+.*\btrip\b|flights?|hotels?|weather|forecast|itinerary\s+for)\b",
-            query.lower(),
-        ))
-        if not also_planning_trip:
-            elapsed = time.time() - start_time
-            logger.info("[SUPERVISOR] OK TRAVEL intent (%.1fs) | Agents: [user_mcp] | Query: '%s'", elapsed, query)
-            return {
-                "guardrail_allowed": True,
-                "query_intent": "travel",
-                "guardrail_reason": "",
-                "selected_agents": ["user_mcp_agent"],
-                "trip_constraints": state.get("trip_constraints") or empty_constraints(),
-                "resolved_query": query,
-                "supervisor_reasoning": "User explicitly requested an action on their connected MCP integration.",
-                "messages": [AIMessage(content="Routing to user_mcp_agent.")],
-                "llm_calls": llm_calls,
-            }
+        return {
+            "guardrail_allowed": True,
+            "query_intent": "mcp",
+            "guardrail_reason": "",
+            "selected_agents": ["user_mcp_agent"],
+            "target_mcp_servers": target_servers,
+            "trip_constraints": state.get("trip_constraints") or empty_constraints(),
+            "resolved_query": resolved_mcp_query,
+            "supervisor_reasoning": f"LLM router matched external integration(s): {', '.join(target_servers) or 'auto'}.",
+            "messages": [AIMessage(content="Routing to user_mcp_agent.")],
+            "llm_calls": llm_calls,
+        }
 
     # ── CHAT ─────────────────────────────────────────────────────────────
     if intent == "chat":
@@ -154,6 +127,7 @@ def supervisor_agent(state: TravelState) -> dict:
         return {
             "guardrail_allowed": True,
             "query_intent": "chat",
+            "needs_past_trips": needs_past_trips,
             "guardrail_reason": "",
             "selected_agents": [],
             "trip_constraints": empty_constraints(),
@@ -256,9 +230,6 @@ User request:
             name for name in AGENT_ORDER
             if name in requested_agents and name in KNOWN_AGENTS
         ]
-        # Never run user_mcp_agent unless the user explicitly asked for an external MCP integration
-        if not is_mcp_req:
-            selected_agents = [name for name in selected_agents if name != "user_mcp_agent"]
 
         # If no agents were selected, intelligently default based on query keywords
         if not selected_agents:
@@ -293,6 +264,7 @@ User request:
     return {
         "guardrail_allowed": True,
         "query_intent": "travel",
+        "needs_past_trips": needs_past_trips,
         "guardrail_reason": guardrail_reason,
         "selected_agents": selected_agents,
         "trip_constraints": constraints,

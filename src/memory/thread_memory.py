@@ -271,6 +271,9 @@ def finalize_memory_trace(
     memory_trace["query_was_rewritten"] = query_was_rewritten
     memory_trace["resolved_query"] = resolved
     memory_trace["original_query"] = user_input
+    needs_past = bool(serialized.get("needs_past_trips", False))
+    memory_trace["needs_past_trips"] = needs_past
+    memory_trace["vector_mode"] = "on_demand" if needs_past else "skipped"
     memory_trace["strategy_chosen"] = (
         "chat_recall"      if query_intent == "chat" else
         "constraint_reuse" if memory_trace.get("has_prior_constraints") and not query_was_rewritten else

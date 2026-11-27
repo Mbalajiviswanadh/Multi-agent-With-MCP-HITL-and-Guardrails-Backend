@@ -59,6 +59,8 @@ def start_google_oauth(
     server_slug: str,
     display_name: str,
     scopes: list[str],
+    mcp_url: str = "",
+    transport: str = "builtin_google",
 ) -> str:
     """Build Google OAuth consent URL and store PKCE state."""
     if not settings.google_oauth_client_id or not settings.google_oauth_client_secret:
@@ -76,6 +78,8 @@ def start_google_oauth(
         "user_id": user_id,
         "server_slug": server_slug,
         "display_name": display_name,
+        "mcp_url": mcp_url,
+        "transport": transport,
         "scopes": scopes,
         "code_verifier": verifier,
         "created_at": time.time(),

@@ -92,6 +92,17 @@ def _filter_target_servers(query: str, available_meta: list[dict[str, Any]]) -> 
     return None
 
 
+def _emit_live(stage: str, text: str) -> None:
+    """Emit a live progress event to LangGraph stream_mode='custom' (no-op outside streaming)."""
+    try:
+        from langgraph.config import get_stream_writer
+        writer = get_stream_writer()
+        if writer:
+            writer({"stage": stage, "text": text})
+    except Exception:
+        pass
+
+
 def _trim(text: str, limit: int = 3000) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + "\n...[truncated]"
@@ -297,7 +308,31 @@ def user_mcp_agent(state: TravelState) -> dict[str, Any]:
             "messages": [AIMessage(content=msg)],
         }
 
-    target_server_ids = _filter_target_servers(query, available_meta)
+    llm_selected_servers = [s.lower() for s in (state.get("target_mcp_servers") or []) if s]
+    target_server_ids: set[str] | None = None
+    if llm_selected_servers and available_meta:
+        matched = {
+            str(srv["id"])
+            for srv in available_meta
+            if srv.get("id")
+            and (
+                str(srv.get("display_name", "")).lower() in llm_selected_servers
+                or str(srv.get("server_slug", "")).lower() in llm_selected_servers
+            )
+        }
+        if matched:
+            target_server_ids = matched
+            logger.info("[USER_MCP_AGENT] Using LLM-selected server(s): %s", state.get("target_mcp_servers"))
+    if target_server_ids is None:
+        target_server_ids = _filter_target_servers(query, available_meta)
+
+    selected_server_names = (
+        [s.get("display_name", s.get("server_slug", "MCP")) for s in available_meta if str(s.get("id", "")) in target_server_ids]
+        if target_server_ids
+        else servers_available
+    )
+    _emit_live("mcp_servers", f"Selected MCP server: {', '.join(selected_server_names) or 'All connected'}")
+
     tools, tool_origin = load_user_mcp_tools_sync(user_id, allowed_server_ids=target_server_ids)
     if not tools:
         msg = (
@@ -321,39 +356,52 @@ def user_mcp_agent(state: TravelState) -> dict[str, Any]:
 
     tool_map = {t.name: t for t in tools}
 
-    # Build context so external tools have access to the generated plan OR recent thread history
+    # Build context: always include recent conversation turns so follow-up answers
+    # ("team meet, 10-11am", "yes use those") see the original task, plus any trip plan.
     context_blocks: list[str] = []
-    if state.get("final_response"):
-        context_blocks.append(f"Current Trip Plan / Response:\n{_trim(state['final_response'], 1800)}")
-    elif state.get("itinerary"):
-        context_blocks.append(f"Current Itinerary:\n{_trim(state['itinerary'], 1800)}")
-    else:
-        recent = filter_real_messages(state.get("messages", []))[-3:]
-        if recent:
-            hist = "\n".join(
-                f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {_trim(str(m.content), 900)}"
-                for m in recent
-            )
-            context_blocks.append(f"Recent Conversation:\n{hist}")
+    recent = filter_real_messages(state.get("messages", []))[-4:]
+    if recent:
+        hist = "\n".join(
+            f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {_trim(str(m.content), 700)}"
+            for m in recent
+        )
+        context_blocks.append(f"Recent Conversation:\n{hist}")
+
+    if state.get("itinerary"):
+        context_blocks.append(f"Current Itinerary:\n{_trim(state['itinerary'], 1500)}")
+    elif state.get("final_response") and len(str(state.get("final_response", ""))) > 350:
+        # Include prior final_response only when it looks like a real plan, not a short Q&A
+        context_blocks.append(f"Current Trip Plan:\n{_trim(state['final_response'], 1500)}")
 
     constraints = state.get("trip_constraints") or {}
     if any(constraints.get(k) for k in ("destination", "origin", "duration", "budget")):
         context_blocks.append(f"Trip Constraints: {json.dumps(constraints)}")
 
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y-%m-%d (%A)")
+
     system_prompt = (
-        "You are an external integration execution agent for TripMate AI.\n"
-        "Use the user's connected MCP tools to fulfill their request (for example: "
-        "creating a Google Doc/Sheet, adding events to Google Calendar, or creating/updating Notion pages).\n"
-        "IMPORTANT RULES:\n"
-        "1. Always populate BOTH the title/name property (e.g. properties={'title': '...'}) AND the full content body — never leave a page blank or unnamed.\n"
-        "2. When creating a new top-level page, omit `parent` unless the user named a specific existing database/page. To nest a child page inside a page you just created, use `parent={'page_id': '<created_id>'}`.\n"
-        "3. If a tool returns a validation or property error (e.g. 'Property Name not found'), "
-        "read the error carefully and use the exact property name it suggests (e.g. 'Title').\n"
-        "4. Always include every created page/document/event URL returned by the tools in your final response."
+        "You are an autonomous external integration execution agent for TripMate AI.\n"
+        f"Today's date is {today_str}.\n"
+        "Use the user's connected MCP tools to EXECUTE their request immediately.\n"
+        "CRITICAL EXECUTION RULES:\n"
+        "1. DO NOT ask unnecessary clarifying questions or waste turns confirming minor details. "
+        "Execute the tool right away using sensible defaults when minor fields aren't specified "
+        "(e.g., default title 'Google Meet' or 'Trip Event', default time 10:00-11:00 if only a date is given, "
+        "default calendar_id='primary').\n"
+        "2. NEVER ask the user for internal IDs (account_id, calendar_id, parent_id, database_id). "
+        "If a tool needs an ID you don't have, call a list/search tool first (e.g. list_calendars, list_accounts, "
+        "notion-search, list_drive_files) to discover it automatically, or use 'primary' / omit parent.\n"
+        "3. For Notion/Docs pages: always populate BOTH the title/name property (e.g. properties={'title': '...'}) "
+        "AND the full content body — never leave a page blank or unnamed.\n"
+        "4. If a tool returns a validation or property error, read the error message and retry with the corrected arguments.\n"
+        "5. Always include every created page/document/event URL or Meet link returned by the tools in your final response.\n"
+        "6. If none of your available tools can perform the requested action, politely explain that you don't have a tool for that right now and mention what connected integrations you can help with."
     )
     user_prompt = f"User Request: {query}\n\n" + "\n\n".join(context_blocks)
 
     selected_tools = _select_relevant_tools(query, tools, tool_origin, max_tools=_MAX_BOUND_TOOLS)
+    _emit_live("mcp_tool_rag", f"Tool RAG ({len(tools)} → {len(selected_tools)}): {', '.join(t.name for t in selected_tools)}")
     compact_tools = [_compact_tool_for_llm(t) for t in selected_tools]
     llm_with_tools = bind_tools_resilient(compact_tools)
     messages: list[Any] = [
@@ -387,9 +435,13 @@ def user_mcp_agent(state: TravelState) -> dict[str, Any]:
 
                 tool_obj = tool_map.get(t_name)
                 if not tool_obj:
-                    output = f"Tool '{t_name}' is not available."
+                    output = (
+                        f"I don't currently have the tool '{t_name}' available in your connected integrations "
+                        f"({', '.join(servers_available) or 'none'})."
+                    )
                     status = "error"
                 else:
+                    _emit_live("mcp_tool_call", f"Calling {t_name} ({server_label})…")
                     try:
                         output = _invoke_tool(tool_obj, t_args)
                         status = "error" if _is_tool_error(output) else "success"
@@ -457,7 +509,10 @@ def user_mcp_agent(state: TravelState) -> dict[str, Any]:
         "mcp_trace": {
             "invoked": True,
             "servers_available": servers_available,
+            "servers_selected": selected_server_names,
             "servers_used": servers_used,
+            "tools_total": len(tools),
+            "tools_filtered": [t.name for t in selected_tools],
             "tool_calls": tool_trace,
         },
         "messages": [AIMessage(content=final_action_text)],

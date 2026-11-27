@@ -54,7 +54,7 @@ from src.memory.mem0_service import (
 )
 from src.memory.profile_store import load_user_profile
 from src.memory.thread_memory import finalize_memory_trace, load_thread_memory
-from src.memory.vector_store import store_trip_embedding, find_similar_trips
+from src.memory.vector_store import store_trip_embedding
 from src.reliability.llm_factory import resilient_llm
 from src.reliability.retry_policy import MCP_RETRY_POLICY, LLM_RETRY_POLICY
 
@@ -220,6 +220,7 @@ def serialize_result(result: dict[str, Any], thread_id: str) -> dict[str, Any]:
         "llm_calls":            result.get("llm_calls", 0),
         "user_mcp_results":     result.get("user_mcp_results", ""),
         "mcp_trace":            result.get("mcp_trace", {}),
+        "needs_past_trips":     bool(result.get("needs_past_trips", False)),
     }
 
 
@@ -243,15 +244,14 @@ def _prepare_turn(
         travel_graph, config, thread_id
     )
 
-    # ── Tier 2 (Mem0) + Tier 3 (Vector) + Connected MCPs: Load in parallel ──
+    # ── Tier 2 (Mem0) + Profile + Connected MCPs: Load in parallel ──
+    # (Tier 3 pgvector past-trip search is now lazy/on-demand in chat/itinerary!)
     user_profile: dict[str, Any] = {}
-    similar_trips: list[dict[str, Any]] = []
     connected_mcps: list[dict[str, Any]] = []
     if user_id and user_id != "anonymous":
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             f_profile = executor.submit(load_user_profile, user_id)
             f_mem0 = executor.submit(mem0_get_user_context, user_input, user_id, 5)
-            f_trips = executor.submit(find_similar_trips, user_id, user_input, 2)
             f_mcps = executor.submit(get_enabled_user_mcps, user_id, False)
 
             try:
@@ -268,19 +268,13 @@ def _prepare_turn(
                 logger.warning("[MEM0] Context load failed for user=%s: %s", user_id, exc)
 
             try:
-                similar_trips = f_trips.result() or []
-                memory_trace["vector_hits"] = len(similar_trips)
-            except Exception as exc:
-                logger.warning("[VECTOR] Similar trips failed for user=%s: %s", user_id, exc)
-
-            try:
                 connected_mcps = f_mcps.result() or []
             except Exception as exc:
                 logger.warning("[MCP_STORE] Failed to load connected MCPs for user=%s: %s", user_id, exc)
 
     state_input = cast(TravelState, initial_state(user_input, user_id=user_id, thread_id=thread_id))
     state_input["user_profile"]       = user_profile
-    state_input["similar_past_trips"] = similar_trips
+    state_input["similar_past_trips"] = []
     state_input["trip_constraints"]   = existing_constraints
     state_input["context_summary"]    = existing_summary
     state_input["connected_mcp_tools"] = connected_mcps
@@ -348,8 +342,11 @@ def stream_travel_agent(
         for stream_mode, chunk in travel_graph.stream(
             state_input,
             config=config,
-            stream_mode=["updates", "messages"],
+            stream_mode=["updates", "messages", "custom"],
         ):
+            if stream_mode == "custom" and isinstance(chunk, dict):
+                yield ("live_step", chunk)
+                continue
             if stream_mode == "updates" and isinstance(chunk, dict):
                 for node, update in chunk.items():
                     if node == "__interrupt__" or not isinstance(update, dict):

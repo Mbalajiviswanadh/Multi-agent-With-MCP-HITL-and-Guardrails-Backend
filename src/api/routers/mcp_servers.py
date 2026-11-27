@@ -134,6 +134,34 @@ async def connect_mcp_server(
             val = f"Bearer {val}"
         headers[h_name] = val
         auth_payload = {"api_key": req.api_key.strip(), "header_name": h_name}
+    elif ".googleapis.com" in clean_url.lower():
+        # Google official remote MCPs (calendarmcp.googleapis.com, drivemcp.googleapis.com, etc.)
+        # allow unauthenticated tools/list but reject tools/call unless a Google OAuth Bearer token is sent.
+        low_url = clean_url.lower()
+        if "calendar" in low_url:
+            scopes = [
+                "https://www.googleapis.com/auth/calendar",
+                "https://www.googleapis.com/auth/calendar.events",
+            ]
+        elif "drive" in low_url:
+            scopes = [
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/documents",
+            ]
+        else:
+            scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+        try:
+            auth_url = start_google_oauth(
+                user_id=user_id,
+                server_slug=slug,
+                display_name=display_name,
+                scopes=scopes,
+                mcp_url=clean_url,
+                transport=transport,
+            )
+            return {"status": "auth_required", "authorize_url": auth_url}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     try:
         tools = await discover_remote_mcp_tools(clean_url, transport=transport, headers=headers)
@@ -215,7 +243,7 @@ async def mcp_oauth_callback(
         exchanged = exchange_oauth_callback(state=state, code=code)
         slug = exchanged["server_slug"]
 
-        if exchanged["kind"] == "google_oauth":
+        if exchanged["kind"] == "google_oauth" and not exchanged.get("mcp_url"):
             entry = get_catalog_entry(slug)
             tools = entry["tools_preview"] if entry else []
             auth_type = "google_oauth"
@@ -226,7 +254,7 @@ async def mcp_oauth_callback(
                 transport=exchanged["transport"],
                 headers={"Authorization": f"Bearer {tok}"} if tok else None,
             )
-            auth_type = "remote_oauth"
+            auth_type = "google_oauth" if exchanged["kind"] == "google_oauth" else "remote_oauth"
 
         conn = upsert_mcp_connection(
             user_id=exchanged["user_id"],

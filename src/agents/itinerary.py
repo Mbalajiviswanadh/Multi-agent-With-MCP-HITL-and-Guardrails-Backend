@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.agents.state import TravelState
 from src.core.logging_config import get_logger
+from src.memory.vector_store import find_similar_trips
 from src.reliability.llm_factory import resilient_llm
 
 logger = get_logger("TripMateAI.agents.itinerary")
@@ -27,6 +28,18 @@ def _trim_context(text, max_chars: int = 1200) -> str:
 def itinerary_agent(state: TravelState) -> dict:
     start_time = time.time()
     logger.info("[ITINERARY_AGENT] -> Generating draft itinerary...")
+    user_profile = state.get("user_profile") or {}
+    mem0_ctx = user_profile.get("mem0_context", "")
+    user_id = state.get("user_id", "anonymous")
+    past_trips = state.get("similar_past_trips") or []
+    if not past_trips and state.get("needs_past_trips") and user_id and user_id != "anonymous":
+        past_trips = find_similar_trips(user_id, state.get("user_query", ""), top_k=2)
+    past_str = "\n".join(
+        f"- {t.get('destination', 'Trip')}: {str(t.get('summary', ''))[:300]}"
+        for t in past_trips[:2]
+        if t.get("summary")
+    )
+
     prompt = f"""\
 Create a complete travel itinerary.
 
@@ -35,6 +48,12 @@ User Query:
 
 Trip Constraints:
 {state.get('trip_constraints', {})}
+
+User Memory & Preferences:
+{_trim_context(mem0_ctx, 500) or 'None'}
+
+Relevant Past Trips:
+{_trim_context(past_str, 700) or 'None'}
 
 Flight Results:
 {_trim_context(state.get('flight_results', ''), 1200)}

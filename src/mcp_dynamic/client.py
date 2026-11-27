@@ -430,7 +430,7 @@ async def load_user_mcp_tools_async(
                 if header_name.lower() == "authorization" and not val.lower().startswith("bearer "):
                     val = f"Bearer {val}"
                 headers[header_name] = val
-            elif conn.get("auth_type") in ("oauth2", "remote_oauth"):
+            elif conn.get("auth_type") in ("oauth2", "remote_oauth", "google_oauth"):
                 tok = ensure_fresh_access_token(conn)
                 if tok:
                     headers["Authorization"] = f"Bearer {tok}"

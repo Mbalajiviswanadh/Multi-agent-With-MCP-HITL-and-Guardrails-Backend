@@ -42,7 +42,8 @@ class TravelState(TypedDict, total=False):
     # ── Supervisor + Guardrail ────────────────────────────────────────────
     guardrail_allowed: bool
     guardrail_reason: str
-    query_intent: str          # "travel" | "chat" | "blocked"
+    query_intent: str          # "travel" | "mcp" | "chat" | "blocked"
+    needs_past_trips: bool
     selected_agents: list[str]
     trip_constraints: dict[str, Any]
     supervisor_reasoning: str
@@ -65,6 +66,7 @@ class TravelState(TypedDict, total=False):
 
     # ── Dynamic User MCP Integrations ─────────────────────────────────────
     connected_mcp_tools: list[dict[str, Any]]
+    target_mcp_servers: list[str]
     user_mcp_results: str
     mcp_trace: dict[str, Any]
 
@@ -95,6 +97,7 @@ def initial_state(user_query: str, user_id: str = "anonymous", thread_id: str = 
         "guardrail_allowed": True,
         "guardrail_reason": "",
         "query_intent": "travel",
+        "needs_past_trips": False,
         "selected_agents": [],
         "trip_constraints": empty_constraints(),
         "supervisor_reasoning": "",
@@ -109,6 +112,7 @@ def initial_state(user_query: str, user_id: str = "anonymous", thread_id: str = 
         "final_response": "",
         "llm_calls": 0,
         "connected_mcp_tools": [],
+        "target_mcp_servers": [],
         "user_mcp_results": "",
         "mcp_trace": {},
     }

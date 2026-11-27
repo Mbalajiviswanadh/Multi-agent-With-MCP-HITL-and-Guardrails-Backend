@@ -29,6 +29,7 @@ from src.agents.state import TravelState
 from src.core.logging_config import get_logger
 from src.memory.mem0_service import mem0_add_async, mem0_get_user_context, mem0_format_for_context
 from src.memory.thread_memory import get_sliding_window
+from src.memory.vector_store import find_similar_trips, get_recent_trips
 from src.reliability.llm_factory import resilient_llm
 
 logger = get_logger("TripMateAI.agents.chat")
@@ -46,6 +47,7 @@ Guidelines:
 - If the user asks what you can do, explain that you can plan trips, find
   flights, hotels, weather, and budgets — just describe the trip!
 - Never invent or recommend specific flights/hotels unless the user explicitly asks.
+- If the user asks about their past trips or saved profile/memory (e.g. "what's my last trip plan?"), summarize the details from Known User Context / Saved Past Trip Plans accurately.
 - Keep responses SHORT (2-4 sentences for greetings, 4-6 for capability questions).
 """
 
@@ -77,6 +79,39 @@ def chat_agent(state: TravelState) -> dict:
 
     if mem0_context:
         context_parts.append(mem0_context)
+
+    # On-demand pgvector past-trip retrieval: only query & inject when the router
+    # detected the user actually asked about past/previous/last trips (0 wasted tokens on "Hi").
+    if state.get("needs_past_trips") and user_id and user_id != "anonymous":
+        try:
+            from langgraph.config import get_stream_writer
+            w = get_stream_writer()
+            if w:
+                w({"stage": "memory_pgvector", "text": "Recalling past trips from pgvector…"})
+        except Exception:
+            pass
+        recent_trips = get_recent_trips(user_id, limit=3)
+        similar_trips = state.get("similar_past_trips") or find_similar_trips(user_id, query, top_k=2)
+        seen_summaries: set[str] = set()
+        trip_lines: list[str] = []
+        for label, bucket in (("Recent", recent_trips), ("Related", similar_trips)):
+            for t in bucket:
+                dest = t.get("destination", "Unknown")
+                summ = str(t.get("summary", "")).strip()
+                key = f"{dest}:{summ[:80]}"
+                if key in seen_summaries or not summ:
+                    continue
+                seen_summaries.add(key)
+                created = str(t.get("created_at", ""))[:10]
+                date_tag = f" ({created})" if created else ""
+                trip_lines.append(f"- [{label}] Trip to {dest}{date_tag}: {summ[:450]}")
+                if len(trip_lines) >= 4:
+                    break
+            if len(trip_lines) >= 4:
+                break
+
+        if trip_lines:
+            context_parts.append("Saved Past Trip Plans (newest first):\n" + "\n".join(trip_lines))
 
     memory_context = "\n".join(context_parts)
 

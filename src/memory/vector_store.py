@@ -197,3 +197,31 @@ def find_similar_trips(
     except Exception as exc:
         logger.error("[VECTOR] Semantic search failed: %s", exc)
         return []
+
+
+def get_recent_trips(user_id: str, limit: int = 3) -> list[dict[str, Any]]:
+    """
+    Fetch the user's most recent finalized trips ordered by `created_at DESC`
+    so queries like "what is my last trip plan?" always get the latest trip.
+    """
+    if not user_id or user_id == "anonymous":
+        return []
+    try:
+        pool = get_pool()
+        with pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT destination, summary, metadata, created_at
+                FROM trip_memories_vector
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            ).fetchall()
+        results = [dict(row) for row in rows]
+        logger.info("[VECTOR] Loaded %d recent trips for user=%s", len(results), user_id)
+        return results
+    except Exception as exc:
+        logger.warning("[VECTOR] Recent trips fetch failed: %s", exc)
+        return []
