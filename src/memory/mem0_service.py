@@ -69,10 +69,10 @@ def _build_mem0_config() -> dict:
         "llm": {
             "provider": "groq",
             "config": {
-                "model": "openai/gpt-oss-20b",      # Available on Groq key; 600 tokens balances JSON + 8k TPM limit
+                "model": "openai/gpt-oss-20b",      # 20B: 8k TPM on-demand; max_tokens=300 leaves ~7700 for input context
                 "api_key": settings.groq_api_key,
                 "temperature": 0.1,
-                "max_tokens": 600,
+                "max_tokens": 300,                 # Lowered: Mem0 fact-extraction JSON is short; more budget for input
             },
         },
         "embedder": {

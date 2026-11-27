@@ -39,6 +39,11 @@ async def discover_remote_mcp_tools(
     """
     Perform a 1-time handshake with a remote MCP server to verify connectivity
     and cache its available tool schemas.
+
+    Raises a plain Exception (never ExceptionGroup) so callers can inspect the
+    error message with str() — Python 3.11 TaskGroup wraps connection errors in
+    ExceptionGroup which makes "401 Unauthorized" appear as the cryptic
+    "unhandled errors in a TaskGroup (1 sub-exception)".
     """
     server_cfg: dict[str, Any] = {
         "transport": transport if transport in ("streamable_http", "sse") else "streamable_http",
@@ -47,9 +52,16 @@ async def discover_remote_mcp_tools(
     if headers:
         server_cfg["headers"] = headers
 
-    client = MultiServerMCPClient({"user_server": server_cfg})
-    tools = await client.get_tools()
-    return [_serialize_tool_schema(t) for t in tools]
+    try:
+        client = MultiServerMCPClient({"user_server": server_cfg})
+        tools = await client.get_tools()
+        return [_serialize_tool_schema(t) for t in tools]
+    except Exception as exc:
+        # Unwrap ExceptionGroup so the real error (e.g. "401 Unauthorized") is visible
+        sub_excs = getattr(exc, "exceptions", None)
+        if sub_excs:
+            raise sub_excs[0] from exc
+        raise
 
 
 # =========================================================
@@ -59,6 +71,25 @@ async def discover_remote_mcp_tools(
 class _CreateDocInput(BaseModel):
     title: str = Field(description="Title of the Google Doc to create (e.g. 'Goa 3-Day Trip Plan').")
     content: str = Field(description="Full text/markdown content to write into the Google Doc.")
+
+
+class _UpdateDocInput(BaseModel):
+    file_id: str = Field(description="The Google Doc file ID to update/append content to.")
+    content: str = Field(description="Text content to append at the end of the existing document.")
+
+
+class _DeleteDriveInput(BaseModel):
+    file_id: str = Field(description="The Google Drive file ID to permanently delete.")
+
+
+class _CreateSheetInput(BaseModel):
+    title: str = Field(description="Title of the Google Sheet (e.g. 'Goa Trip Budget Breakdown').")
+    headers: list[str] = Field(description="Column header names (e.g. ['Category', 'Item', 'Estimated Cost']).")
+    rows: list[list[str]] = Field(description="Data rows matching the header columns.")
+
+
+class _ReadDriveInput(BaseModel):
+    file_id: str = Field(description="The Google Drive file ID to read.")
 
 
 class _ListDriveInput(BaseModel):
@@ -134,6 +165,110 @@ def _build_google_drive_tools(conn: dict[str, Any]) -> list[StructuredTool]:
                 return "No matching files found in your Google Drive."
             return "\n".join(f"- {f['name']} ({f.get('webViewLink', f['id'])})" for f in files)
 
+    def create_google_sheet(title: str, headers: list[str], rows: list[list[str]]) -> str:
+        """Create a native Google Sheet by uploading CSV converted via Drive v3 (works with drive.file scope!)."""
+        import csv
+        import io
+        import json as _json
+
+        token = ensure_fresh_access_token(conn)
+        if not token:
+            return "Error: Google Drive OAuth token is missing. Please reconnect Google Drive."
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        if headers:
+            writer.writerow(headers)
+        for r in rows:
+            writer.writerow(r)
+        csv_bytes = buf.getvalue().encode("utf-8")
+
+        boundary = "tripmate_sheet_boundary"
+        meta_json = _json.dumps({
+            "name": title,
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+        })
+        body = (
+            f"--{boundary}\r\n"
+            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{meta_json}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: text/csv; charset=UTF-8\r\n\r\n"
+        ).encode("utf-8") + csv_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        with httpx.Client(timeout=20.0) as client:
+            res = client.post(
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+                content=body,
+            )
+            if res.status_code >= 400:
+                return f"Google Sheets/Drive API error ({res.status_code}): {res.text[:250]}"
+            sheet = res.json()
+            link = sheet.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{sheet['id']}/edit"
+            return f"Created Google Sheet '{title}': {link}"
+
+    def read_drive_file(file_id: str) -> str:
+        token = ensure_fresh_access_token(conn)
+        if not token:
+            return "Error: Google Drive OAuth token is missing."
+        with httpx.Client(timeout=15.0) as client:
+            res = client.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"mimeType": "text/plain"},
+            )
+            if res.status_code >= 400:
+                return f"Google Drive read error ({res.status_code}): {res.text[:250]}"
+            return res.text[:4000]
+
+    def update_google_doc(file_id: str, content: str) -> str:
+        """Append text content to the end of an existing Google Doc."""
+        token = ensure_fresh_access_token(conn)
+        if not token:
+            return "Error: Google Drive OAuth token is missing. Please reconnect Google Drive."
+
+        with httpx.Client(timeout=20.0) as client:
+            # Get current doc to find the end index
+            info_res = client.get(
+                f"https://docs.googleapis.com/v1/documents/{file_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if info_res.status_code >= 400:
+                return f"Google Docs API error ({info_res.status_code}): {info_res.text[:250]}"
+            doc_info = info_res.json()
+            end_index = doc_info.get("body", {}).get("content", [{}])[-1].get("endIndex", 1)
+            # Insert at end_index - 1 (before the final newline the API always keeps)
+            insert_index = max(1, int(end_index) - 1)
+
+            upd_res = client.post(
+                f"https://docs.googleapis.com/v1/documents/{file_id}:batchUpdate",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"requests": [{"insertText": {"location": {"index": insert_index}, "text": f"\n\n{content}"}}]},
+            )
+            if upd_res.status_code >= 400:
+                return f"Google Docs update error ({upd_res.status_code}): {upd_res.text[:250]}"
+        return f"Updated Google Doc (https://docs.google.com/document/d/{file_id}/edit) — content appended successfully."
+
+    def delete_drive_file(file_id: str) -> str:
+        """Permanently delete a file from Google Drive by its file ID."""
+        token = ensure_fresh_access_token(conn)
+        if not token:
+            return "Error: Google Drive OAuth token is missing. Please reconnect Google Drive."
+        with httpx.Client(timeout=15.0) as client:
+            res = client.delete(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if res.status_code == 204:
+                return f"Deleted file (ID: {file_id}) from Google Drive successfully."
+            if res.status_code >= 400:
+                return f"Google Drive delete error ({res.status_code}): {res.text[:250]}"
+        return f"File {file_id} deleted."
+
     return [
         StructuredTool.from_function(
             func=create_google_doc,
@@ -142,10 +277,34 @@ def _build_google_drive_tools(conn: dict[str, Any]) -> list[StructuredTool]:
             args_schema=_CreateDocInput,
         ),
         StructuredTool.from_function(
+            func=update_google_doc,
+            name="update_google_doc",
+            description="Append or add text content to the end of an existing Google Doc by its file_id (e.g. to add a sheet link, notes, or updates).",
+            args_schema=_UpdateDocInput,
+        ),
+        StructuredTool.from_function(
+            func=create_google_sheet,
+            name="create_google_sheet",
+            description="Create a native Google Sheet (spreadsheet / Excel-like table) in the user's Google Drive with column headers and rows.",
+            args_schema=_CreateSheetInput,
+        ),
+        StructuredTool.from_function(
             func=list_drive_files,
             name="list_drive_files",
             description="List or search recent files in the user's Google Drive.",
             args_schema=_ListDriveInput,
+        ),
+        StructuredTool.from_function(
+            func=read_drive_file,
+            name="read_drive_file",
+            description="Read the plain-text content of a Google Doc in the user's Google Drive by file_id.",
+            args_schema=_ReadDriveInput,
+        ),
+        StructuredTool.from_function(
+            func=delete_drive_file,
+            name="delete_drive_file",
+            description="Permanently delete a file from the user's Google Drive by its file_id. Use with caution — this cannot be undone.",
+            args_schema=_DeleteDriveInput,
         ),
     ]
 
@@ -222,12 +381,21 @@ def _build_google_calendar_tools(conn: dict[str, Any]) -> list[StructuredTool]:
 # Per-Request Dynamic Tool Loader
 # =========================================================
 
-async def load_user_mcp_tools_async(user_id: str) -> tuple[list[Any], dict[str, str]]:
+async def load_user_mcp_tools_async(
+    user_id: str,
+    allowed_server_ids: set[str] | None = None,
+) -> tuple[list[Any], dict[str, str]]:
     """
-    Load all enabled MCP tools for `user_id` lazily at execution time.
+    Load enabled MCP tools for `user_id` lazily at execution time.
+    When `allowed_server_ids` is provided, only those servers are initialized/connected
+    (avoids unnecessary network handshakes to unrelated remote MCP servers).
     Returns (tools_list, tool_name_to_server_label_map).
     """
     connections = get_enabled_user_mcps(user_id, include_secrets=True)
+    if allowed_server_ids:
+        filtered = [c for c in connections if str(c["id"]) in allowed_server_ids]
+        if filtered:
+            connections = filtered
     if not connections:
         return [], {}
 
@@ -286,6 +454,36 @@ async def load_user_mcp_tools_async(user_id: str) -> tuple[list[Any], dict[str, 
     return all_tools, tool_origin
 
 
-def load_user_mcp_tools(user_id: str) -> tuple[list[Any], dict[str, str]]:
-    """Synchronous wrapper for `load_user_mcp_tools_async`."""
-    return asyncio.run(load_user_mcp_tools_async(user_id))
+def load_user_mcp_tools_sync(
+    user_id: str,
+    allowed_server_ids: set[str] | None = None,
+) -> tuple[list[Any], dict[str, str]]:
+    """
+    Synchronous wrapper for `load_user_mcp_tools_async`.
+
+    Safe to call from a sync context (e.g., LangGraph node).
+    Runs the async loader in a fresh background thread to avoid
+    'RuntimeError: This event loop is already running' when FastAPI's
+    event loop is already active.
+    """
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_run_load_async, user_id, allowed_server_ids)
+        return future.result(timeout=30)
+
+
+def _run_load_async(
+    user_id: str,
+    allowed_server_ids: set[str] | None = None,
+) -> tuple[list[Any], dict[str, str]]:
+    """Run the async loader in a fresh event loop (called from a background thread)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(load_user_mcp_tools_async(user_id, allowed_server_ids=allowed_server_ids))
+    finally:
+        loop.close()
+
+
+# Backwards-compat alias
+load_user_mcp_tools = load_user_mcp_tools_sync

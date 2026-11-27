@@ -63,9 +63,24 @@ def get_mcp_catalog(current_user: dict = Depends(get_current_user)):
 
 @router.get("/servers")
 def get_user_mcp_servers(current_user: dict = Depends(get_current_user)):
-    """List connected MCP servers for the logged-in user (secrets stripped)."""
+    """List connected MCP servers for the logged-in user (secrets stripped).
+    
+    For built-in catalog integrations (google_drive, google_calendar), always
+    returns the latest tools_preview from the catalog — so existing connections
+    automatically show newly added tools without needing to reconnect.
+    """
     user_id = str(current_user["id"])
-    return {"servers": list_user_mcp_connections(user_id)}
+    servers = list_user_mcp_connections(user_id)
+
+    # Inject latest catalog tools for builtin integrations so the UI always shows
+    # the current tool count even if the DB row has an older cached_tools snapshot.
+    catalog_map = {entry["slug"]: entry for entry in MCP_CATALOG if entry.get("transport") == "builtin_google"}
+    for srv in servers:
+        slug = srv.get("server_slug", "")
+        if slug in catalog_map:
+            srv["cached_tools"] = catalog_map[slug].get("tools_preview", srv.get("cached_tools", []))
+
+    return {"servers": servers}
 
 
 @router.post("/connect")
@@ -136,9 +151,37 @@ async def connect_mcp_server(
         return {"status": "connected", "connection": conn}
 
     except Exception as exc:
+        # Unwrap ExceptionGroup (Python 3.11+ TaskGroup errors) to get the real cause.
+        # MultiServerMCPClient wraps connection errors in ExceptionGroup, so a 401/OAuth
+        # challenge from Notion/etc. arrives as "unhandled errors in a TaskGroup".
         err_msg = str(exc)
-        # If no API key was supplied and server looks auth-gated, try OAuth 2.1 discovery
-        if not req.api_key.strip() and any(k in err_msg.lower() for k in ("401", "unauthorized", "auth", "forbidden")):
+        real_cause = exc
+        sub_excs = getattr(exc, "exceptions", None)
+        if sub_excs:
+            real_cause = sub_excs[0]
+            err_msg = str(real_cause)
+
+        # Detect auth-required errors — including ExceptionGroup wrappers and
+        # Notion's OAuth challenge which may surface as connection/protocol errors
+        # when no token is provided.
+        auth_error_signals = ("401", "unauthorized", "auth", "forbidden", "403", "taskgroup", "sub-exception")
+        needs_oauth = (
+            not req.api_key.strip()
+            and any(k in err_msg.lower() for k in auth_error_signals)
+        )
+
+        # Always try OAuth discovery for Notion/similar servers when no key was given
+        # and connection failed — they expose .well-known metadata even before auth.
+        if not req.api_key.strip() and not needs_oauth:
+            # Try .well-known probe as a last resort before giving up
+            from src.mcp_dynamic.oauth import discover_mcp_oauth_metadata
+            try:
+                meta = discover_mcp_oauth_metadata(clean_url)
+                needs_oauth = meta is not None
+            except Exception:
+                pass
+
+        if needs_oauth:
             try:
                 auth_url = start_remote_mcp_oauth(
                     user_id=user_id,

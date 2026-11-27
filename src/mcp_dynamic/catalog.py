@@ -15,7 +15,7 @@ MCP_CATALOG: list[dict[str, Any]] = [
         "slug": "google_drive",
         "name": "Google Drive",
         "category": "Productivity",
-        "description": "Save finalized trip itineraries as formatted Google Docs in your Drive.",
+        "description": "Save, read, update, and manage files in your Google Drive — docs, sheets, and more.",
         "auth_mode": "google_oauth",
         "transport": "builtin_google",
         "scopes": [
@@ -24,7 +24,11 @@ MCP_CATALOG: list[dict[str, Any]] = [
         ],
         "tools_preview": [
             {"name": "create_google_doc", "description": "Create a formatted Google Doc in Drive."},
-            {"name": "list_drive_files", "description": "Search recent files in your Google Drive."},
+            {"name": "update_google_doc", "description": "Append content to an existing Google Doc (e.g. add a sheet link)."},
+            {"name": "create_google_sheet", "description": "Create a Google Sheet (spreadsheet/budget table) in Drive."},
+            {"name": "list_drive_files", "description": "Search and list recent files in your Google Drive."},
+            {"name": "read_drive_file", "description": "Read the text content of a Google Doc in Drive."},
+            {"name": "delete_drive_file", "description": "Permanently delete a file from Google Drive by file ID."},
         ],
         "setup_hint": "Requires GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET in backend .env.",
     },

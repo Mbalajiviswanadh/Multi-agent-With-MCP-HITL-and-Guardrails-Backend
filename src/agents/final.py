@@ -90,6 +90,36 @@ def final_agent(state: TravelState) -> dict:
     is_approved = state.get("approved", False)
     human_feedback = state.get("human_feedback", "").strip()
 
+    # ── FAST PATH: User approved with no feedback ─────────────────────────
+    # Return the already-generated draft as the final response WITHOUT re-running
+    # the LLM. This prevents a completely new (often worse) plan from being generated
+    # when the user just clicks "Approve".
+    if is_approved and not human_feedback:
+        final_response_content = itinerary_draft or state.get("final_response", "")
+        if not final_response_content:
+            final_response_content = "Your trip plan has been approved! Let me know if you'd like any changes."
+
+        # Run output guardrail even on the fast path (adds pricing disclaimer if needed)
+        try:
+            guardrail_result = check_output(
+                final_response_content,
+                flight_results=state.get("flight_results", ""),
+                hotel_results=state.get("hotel_results", ""),
+            )
+            final_response_content = guardrail_result["response"]
+        except Exception:
+            pass  # Guardrail failure is non-fatal on fast path
+
+        elapsed = time.time() - start_time
+        logger.info("[FINAL_AGENT] OK Approved draft returned as-is (%.1fs) — skipped LLM re-generation", elapsed)
+        return {
+            "final_response": final_response_content,
+            "weather_results": weather_results,
+            "selected_agents": selected_agents,
+            "messages": [AIMessage(content=final_response_content)],
+            "llm_calls": state.get("llm_calls", 0),  # No LLM call used
+        }
+
     if is_approved:
         review_context = (
             "The user approved the draft. Present the approved recommendations clearly and cleanly. "
