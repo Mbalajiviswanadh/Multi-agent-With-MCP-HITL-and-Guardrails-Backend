@@ -1,7 +1,30 @@
-# Environments
+# Environments & secrets
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+.env
+.env.*
+.envrc
+
+# Git & IDE
+.git
+.gitignore
+.vscode
+.idea
+
+# Python caches
+__pycache__/
+*.py[codz]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Logs & non-runtime assets
+*.log
+demo.excalidraw
+images/
+evals/
+scripts/

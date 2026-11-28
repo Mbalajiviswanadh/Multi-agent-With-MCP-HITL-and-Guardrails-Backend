@@ -19,6 +19,7 @@ from src.mcp_dynamic.store import run_mcp_schema_migrations
 from src.memory.profile_store import run_schema_migrations
 from src.memory.vector_store import run_vector_schema_migrations
 from src.memory.mem0_service import mem0_get_all, mem0_delete_user
+from src.core.config import settings
 from src.core.database import close_pool
 import os
 import json
@@ -77,8 +78,7 @@ app = FastAPI(
 # CORS Configuration
 # =========================
 
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
-allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+allowed_origins = settings.cors_origins
 
 app.add_middleware(
     CORSMiddleware,

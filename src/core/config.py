@@ -85,7 +85,11 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> list[str]:
-        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
+        origins = [o.strip().rstrip("/") for o in self.allowed_origins.split(",") if o.strip()]
+        fe = self.frontend_url.strip().rstrip("/")
+        if fe and fe not in origins:
+            origins.append(fe)
+        return origins
 
 
 # Module-level singleton — import this everywhere
